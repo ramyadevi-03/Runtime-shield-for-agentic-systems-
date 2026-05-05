@@ -1816,3 +1816,24 @@ er userId or username"}]},"jsonrpc":"2.0","id":6}
 stem-provider' exited unexpectedly with code 1.
 [23:05:17] 🔄 SUPERVISOR: In a full implementation, the Controller would respawn this isolated renderer now.
 [23:05:17] 🚨 SUPERVISOR ALERT: Jailed renderer process 'keycloak-provider' exited unexpectedly with code 1.
+
+--- Secure Bridge Session Start: 2026-05-03 10:02:10 ---
+[10:02:10] 🪪 SPIFFE integration enabled (startup validation mode).
+[10:02:10] 🪪 Bridge SPIFFE ID: spiffe://runtime-shield/bridge
+[10:02:10] 🪪 Expected MCP Server SPIFFE ID: spiffe://runtime-shield/secure-runtime-shield
+[10:02:10] ✅ SPIFFE SVID found at: c:\Users\kavya\OneDrive\Desktop\keycloak-mcp-server\spire\certs\agent.crt
+[10:02:10] ✅ SPIFFE trust bundle found at: c:\Users\kavya\OneDrive\Desktop\keycloak-mcp-server\spire\certs\ca.crt
+[10:02:10] ⚠️ Current transport is stdio, so this is not full mTLS SPIFFE authentication.
+[10:02:10] ✅ Security Gateway initialized
+[10:02:10] 📦 Loaded 2 MCP providers from config
+[10:02:10] 🛡️ NeMo NIM Guardrails active (Jailbreak: True, PII: True)
+[10:02:10] 🕵️‍♂️ PROTECTION MODE ACTIVE: Fraud Engine will enforce risk limits
+[10:02:10] 📊 Dashboard active at http://127.0.0.1:9090
+[10:02:10] ✅ Schema acquired for Tenant customer-delta-99. Guardrails active.
+[10:02:10] 🚀 Launching MCP Provider [filesystem-provider]: node c:/Users/kavya/OneDrive/Desktop/keycloak-mcp-server/dist/index.js
+[10:02:10] 🪟 Sandboxing [filesystem-provider]: Windows Restricted Process Group initialized
+[10:02:10] 🚀 Launching MCP Provider [keycloak-provider]: node c:/Users/kavya/OneDrive/Desktop/keycloak-mcp-server/dist/index.js
+[10:02:10] 🪟 Sandboxing [keycloak-provider]: Windows Restricted Process Group initialized
+[10:02:10] ⌛ Multi-MCP Bridge active and relaying...
+[10:02:11] 🟥 [keycloak-provider] stderr: Keycloak MCP Server running on stdio
+
