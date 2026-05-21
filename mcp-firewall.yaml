@@ -56,6 +56,7 @@ rules:
   - name: redact-emails
     tool: "*"
     action: redact
+    message: "PII Redaction: Automated email masking active."
     match:
       response:
         regex: ".*@.*"
@@ -65,6 +66,7 @@ rules:
     match:
       arguments:
         path: "**/../*"
+        role: "user"
     action: deny
     message: "Security violation: Potential directory traversal detected."
 
@@ -74,6 +76,7 @@ rules:
     match:
       arguments:
         path: "admin/*"
+        role: "user"
     action: deny
     message: "Access denied: The 'admin/' directory is off-limits."
 
@@ -84,6 +87,7 @@ rules:
       arguments:
         path: "secure-experiment-zone/claude-desktop*"
     action: allow
+    message: "Workspace Access: Internal configuration tools permitted."
 
   # 4. Allow access to the Secure Experiment Zone (Safe Agent Workspace)
   - name: allow-experiment-zone-access
@@ -92,10 +96,14 @@ rules:
       arguments:
         path: "secure-experiment-zone*"
     action: allow
+    message: "Sandbox Access: Authorized experiment zone operations."
 
-  # 4. Block all other filesystem access (Defense in Depth)
+  # 4. Block all other filesystem access for standard users (Defense in Depth)
   - name: block-unauthorized-fs
     tool: "read_file|list_directory|write_file"
+    match:
+      arguments:
+        role: "user"
     action: deny
     message: "Security violation: Unauthorized filesystem access attempt."
 
@@ -110,6 +118,7 @@ rules:
   - name: allow-keycloak-tools
     tool: "keycloak_*"
     action: allow
+    message: "Governance: Identity management access granted."
     zone: staging # Default zone for these tools
 
 # Threat Feed Integration
@@ -121,7 +130,7 @@ threat_feed:
 mcp_servers:
   filesystem-provider:
     command: "node"
-    args: ["c:/Users/kavya/OneDrive/Desktop/keycloak-mcp-server/dist/index.js"]
+    args: ["c:/Users/Lenovo/Desktop/Runtime-shield- login/Runtime-shield-for-agentic-systems/dist/index.js", "c:/Users/Lenovo/Desktop/Runtime-shield- login/Runtime-shield-for-agentic-systems"]
     tools:
       - name: "read_file"
         scope: "tool:read_file"
@@ -136,7 +145,7 @@ mcp_servers:
   
   keycloak-provider:
     command: "node"
-    args: ["c:/Users/kavya/OneDrive/Desktop/keycloak-mcp-server/dist/index.js"]
+    args: ["c:/Users/Lenovo/Desktop/Runtime-shield- login/Runtime-shield-for-agentic-systems/dist/index.js"]
     tools:
       - name: "keycloak_list_users"
         scope: "tool:keycloak_read"

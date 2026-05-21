@@ -1,20 +1,14 @@
 {
   "mcpServers": {
     "Secure-Runtime-Shield": {
-      "command": "C:\\Python313\\python.exe",
+      "command": "C:\\Users\\Lenovo\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
       "args": [
-        "c:\\Users\\kavya\\OneDrive\\Desktop\\keycloak-mcp-server\\bridge.py"
+        "-u",
+        "C:\\Users\\Lenovo\\Desktop\\Runtime-shield- login\\Runtime-shield-for-agentic-systems\\bridge.py"
       ],
       "env": {
-        "PYTHONUTF8": "1"
+        "PYTHONIOENCODING": "utf-8"
       }
     }
-  },
-  "preferences": {
-    "coworkScheduledTasksEnabled": false,
-    "ccdScheduledTasksEnabled": false,
-    "sidebarMode": "chat",
-    "coworkWebSearchEnabled": true,
-    "floatingAtollActive": true
   }
 }

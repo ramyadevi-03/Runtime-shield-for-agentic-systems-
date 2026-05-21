@@ -86,4 +86,5 @@ def generate_certs(output_dir):
     print(f"✅ Certificates generated in {output_dir}")
 
 if __name__ == "__main__":
-    generate_certs(r"c:\Users\kavya\OneDrive\Desktop\keycloak-mcp-server\spire\certs")
+    # Fixed path for the active workspace
+    generate_certs(r"c:\Users\Lenovo\Desktop\Runtime-shield- login\Runtime-shield-for-agentic-systems\spire\certs")

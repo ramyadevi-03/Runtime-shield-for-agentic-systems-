@@ -22,7 +22,7 @@ export async function verifySpiffeIdentity(): Promise<{
             const output = execSync('spire-agent api fetch x509', { encoding: 'utf8' });
             if (output.includes("SPIFFE ID:")) {
                 const spiffeId = output.match(/SPIFFE ID:\s+([^\s]+)/)?.[1];
-                console.log(`✅ SPIFFE identity verified via CLI: ${spiffeId}`);
+                console.error(`✅ SPIFFE identity verified via CLI: ${spiffeId}`);
                 return { valid: true, spiffe_id: spiffeId };
             }
         } catch (e) {
@@ -66,7 +66,7 @@ export async function verifySpiffeIdentity(): Promise<{
             }
         }
 
-        console.log(`✅ SPIFFE identity verified: ${spiffeId}`);
+        console.error(`✅ SPIFFE identity verified: ${spiffeId}`);
         return { valid: true, spiffe_id: spiffeId };
 
     } catch (err: any) {
