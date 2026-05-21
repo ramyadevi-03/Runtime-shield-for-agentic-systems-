@@ -1,34 +1,46 @@
 # 🛡️ Runtime Shield for Agentic Systems — Complete Project Walkthrough
 
 > [!NOTE]
-> This document explains **every single file**, how they connect, and how the entire system works — written for someone who is brand new to the project.
+> This document explains **every single file**, how they connect, and how the entire system works — written for someone who is brand new to the project. It provides absolute links to the files and main code symbols to let you navigate the codebase instantly.
 
 ---
 
-## 1. What is This Project? (The Big Picture)
+## 1. What Is This Project? (The Big Picture)
 
-Imagine you have an **AI assistant** (like Claude Desktop) that can use "tools" — it can read files, list users, write files, etc. But what if the AI gets **tricked by a malicious prompt** into reading your passwords, or accessing admin-only data?
+Imagine you have an **AI assistant** (like Claude Desktop) that can use "tools" — it can read files, list users, write files, etc. But what if the AI gets **tricked by a malicious prompt (prompt injection)** into reading your passwords, accessing admin-only data, or leaking sensitive customer information?
 
 **This project is a Security Shield** that sits **between** the AI agent and the tools it uses. It inspects every single tool call the AI makes and decides:
 - ✅ **Allow** — safe, go ahead
 - 🚫 **Block** — nope, that's dangerous
-- ✂️ **Redact** — allow it but scrub out sensitive info (like emails) from the response
+- ✂️ **Redact** — allow it but scrub out sensitive info (like emails, SSNs, credit cards) from the response
 
 ### Real-World Analogy
 Think of it like an **airport security checkpoint**:
 - The AI agent is a passenger trying to board a plane (use a tool)
-- The Shield checks their ID (identity verification)
-- Checks if they're on the no-fly list (firewall rules)
-- Scans their luggage for weapons (fraud detection)
-- Removes any prohibited items (PII redaction)
+- The Shield checks their ID (identity verification via Keycloak / JWT)
+- Checks if they're on the no-fly list (firewall policies)
+- Scans their luggage for weapons (fraud detection & jailbreak analysis)
+- Removes any prohibited items (PII / email redaction)
 
 ---
 
 ## 2. Architecture Overview
 
+The system operates in two core modes:
+1. **Stdio Interception Mode:** For local desktop agents like Claude Desktop. The gateway intercepts stdin/stdout streams.
+2. **HTTP Proxy Mode:** For custom web-based agents (like the Streamlit app). The gateway exposes an OpenAI-compatible endpoint on port `5001`.
+
 ```mermaid
 graph TD
-    A["🤖 AI Agent<br/>(Claude Desktop)"] -->|"JSON-RPC over stdio"| B["🐍 bridge.py<br/>(Security Gateway)"]
+    subgraph Clients
+        A["🤖 AI Agent<br/>(Claude Desktop)"]
+        A2["💻 Custom Chatbot<br/>(damn-vulnerable-llm-agent)"]
+    end
+
+    subgraph Security Gateway
+        B["🐍 bridge.py<br/>(Security Gateway & Proxy)"]
+        B2["📊 fastapi / Uvicorn<br/>(Proxy on Port 5001)"]
+    end
     
     B -->|"Layer 2: Identity Check"| C["🔑 Keycloak<br/>(User Auth + RBAC)"]
     B -->|"Layer 2: Workload ID"| D["🪪 SPIFFE/SPIRE<br/>(Machine Identity)"]
@@ -52,15 +64,15 @@ graph TD
 
 ## 3. The 5-Layer Defense Framework
 
-Every tool call goes through **5 security layers** before it reaches the actual tool:
+Every tool call goes through **5 security layers** before it is allowed to execute:
 
 | Layer | Name | What It Does | Where in Code |
 |-------|------|-------------|---------------|
-| **Layer 1** | Infrastructure Isolation | Runs tools in sandboxed/jailed processes | `JailFactory` class in `bridge.py` |
-| **Layer 2** | Identity & Auth | Verifies WHO is making the call (Keycloak JWT + SPIFFE workload ID) | `JWTVerifier`, `spiffe_allowed()` in `bridge.py` |
-| **Layer 3** | Policy Firewall | Checks the tool call against rules in `mcp-firewall.yaml` | `Gateway.check()` in `bridge.py` |
-| **Layer 4** | Fraud Engine | Tracks risk scores per agent — quarantines if suspicious patterns detected | `FraudDetectionEngine` class in `bridge.py` |
-| **Layer 5** | Privacy Router | Strips emails, PII, secrets from tool responses before AI sees them | `gw.scan_response()` + regex in `bridge.py` |
+| **Layer 1** | Infrastructure Isolation | Runs tool servers in sandboxed/jailed processes | [BaseJailer](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L302) in [bridge.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py) |
+| **Layer 2** | Identity & Auth | Verifies WHO is calling the tool (Keycloak JWT signature + SPIFFE workload ID) | [JWTVerifier](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L597), [spiffe_allowed](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L573) in [bridge.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py) |
+| **Layer 3** | Policy Firewall | Checks tool arguments/response against firewall rules | [Gateway.check](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/mcp_firewall/sdk.py) and [mcp-firewall.yaml](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/mcp-firewall.yaml) |
+| **Layer 4** | Fraud Engine | Tracks risk scores per user/agent. Quarantines suspect sessions | [FraudDetectionEngine](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L63) in [bridge.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py) |
+| **Layer 5** | Privacy & AI Guard | Redacts PII and detects jailbreaks via LLM guardrails (NVIDIA NIM) | [NIMCloudGuard](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L190) in [bridge.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py) |
 
 ---
 
@@ -71,316 +83,161 @@ Every tool call goes through **5 security layers** before it reaches the actual 
 ```
 Runtime-shield-for-agentic-systems/
 ├── bridge.py                 ← 🧠 THE BRAIN — main security gateway (Python)
-├── mcp-firewall.yaml         ← 📋 Firewall rules configuration
-├── .env / .env.example       ← 🔐 Environment variables (secrets, URLs)
-├── docker-compose.yml        ← 🐳 Starts Keycloak + SPIRE containers
+├── mcp-firewall.yaml         ← 📋 Firewall rules and provider configs
+├── .env / .env.example       ← 🔐 Environment variables and API keys
+├── docker-compose.yml        ← 🐳 Keycloak + SPIFFE/SPIRE infrastructure
 ├── package.json              ← 📦 Node.js dependencies
-├── tsconfig.json             ← ⚙️ TypeScript compiler config
+├── tsconfig.json             ← ⚙️ TypeScript configuration
+├── requirements.txt          ← 🐍 Python dependencies
+├── generate_certs.py         ← 🪪 SPIRE certificate generation tool
+├── search_events.py          ← 🔍 Keycloak event search script
+├── run_shield_demo.sh        ← 🚀 Integrated shell launcher script
+├── telemetry.py              ← 📊 Asynchronous database telemetry writer
+├── telemetry.db / .log       ← 💾 Persistent governance database & logs
+├── bridge.log / _demo.log    ← 📄 Runtime gateway output logs
+├── audit_agent.py            ← 🕵️ Standalone/embedded LLM log auditor
+├── shield_sdk.py             ← 🔌 Customer-facing Chatbot SDK
+├── dashboard_client.py       ← 📊 Negotiator for SaaS policies & vault secrets
+├── claude_config.txt         ← 📝 Claude Desktop integration configuration
 │
-├── src/                      ← 📂 TypeScript source (MCP Server)
-│   ├── index.ts              ←    Entry point — creates MCP server
+├── src/                      ← 📂 TypeScript Source (MCP Server)
+│   ├── index.ts              ←    MCP Server setup and stdio bridge
 │   ├── tools/
-│   │   ├── tools.ts          ←    All tool implementations (read_file, keycloak_*, etc.)
-│   │   ├── rbac.ts           ←    Role-Based Access Control helpers
-│   │   └── spiffeAuth.ts     ←    SPIFFE identity verification
+│   │   ├── tools.ts          ←    FS & Keycloak tool definitions
+│   │   ├── rbac.ts           ←    RBAC role validation logic
+│   │   └── spiffeAuth.ts     ←    SPIFFE validation for tools
 │   └── utils/
-│       └── keycloak.ts       ←    Keycloak admin client connection
+│       └── keycloak.ts       ←    Keycloak Admin client
 │
-├── dist/                     ← 📂 Compiled JavaScript (from `npm run build`)
-│   └── index.js              ←    Compiled entry point (runs in Node.js)
+├── dist/                     ← 📂 Compiled JavaScript (Target Executable)
+│   └── index.js              ←    Node executable spawned by Bridge
 │
-├── audit_agent.py            ← 🕵️ Background AI auditor (uses NVIDIA NIM)
-├── shield_sdk.py             ← 🔌 Client SDK for customers to integrate
-├── dashboard_client.py       ← 📊 Multi-tenant dashboard config negotiation
-├── claude_config.txt         ← 📝 Sample Claude Desktop config
-├── demo/                     ← 📂 Test scripts, demos, and legacy files
-│   ├── demo_chatbot_integration.py
-│   ├── demo_prompts_cheatsheet.md
-│   ├── test_stub_execution.py
-│   ├── vulnerable_mcp_actions.py
-│   ├── check_keycloak.py
-│   ├── fix_keycloak_roles.py
-│   ├── patch_keycloak.py
-│   ├── nsjail_deep_dive.md
-│   └── system_health_check.md
+├── mcp_firewall/             ← 📂 Python mcp-firewall SDK Package
+│   ├── sdk.py                ←    Gateway entry point
+│   ├── models.py             ←    Config database structures
+│   ├── dashboard/
+│   │   └── app.py            ←    FastAPI Live Dashboard backend
+│   └── schema/
+│       └── schema_v2.sql     ←    Telemetry SQLite tables definition
 │
-├── spire/                    ← 🪪 SPIFFE/SPIRE configuration
+├── spire/                    ← 🪪 SPIRE Configuration
 │   ├── server/server.conf    ←    SPIRE Server config
 │   ├── agent/agent.conf      ←    SPIRE Agent config
-│   └── certs/                ←    TLS certificates (CA + Agent)
+│   └── certs/                ←    Root CA and signing keys
 │
-├── secure-experiment-zone/   ← 🧪 Safe sandbox directory for AI experiments
-│   ├── claude-desktop/       ←    AI agent's allowed workspace
-│   ├── generate_certs.py     ←    Script to generate SPIRE certificates
-│   └── test_sandbox.txt      ←    Test file
+├── secure-experiment-zone/   ← 🧪 Sandboxed filesystem directory
+│   ├── claude-desktop/       ←    Allowed agent working directory
+│   └── test_sandbox.txt      ←    Test asset
 │
-├── bridge.log                ← 📄 Runtime log of all shield activity
-└── keycloak_data/            ← 💾 Keycloak's persistent data
+├── damn-vulnerable-llm-agent/ ← 🤖 Chatbot Demonstration App
+│   ├── main.py               ←    Streamlit UI and secure agent execution loop
+│   ├── tools.py              ←    Chatbot local tools (GetCurrentUser)
+│   ├── transaction_db.py     ←    SQLite client database driver with seeder
+│   └── transactions.db       ←    Local database containing seeded PII/secrets
+│
+└── demo/                     ← 📂 Testing scripts and legacy tools
+    ├── nsjail_deep_dive.md   ←    Linux sandboxing report
+    ├── system_health_check.md←    Post-deployment validation checklist
+    └── vulnerable_mcp_actions.py ← Intentionally vulnerable MCP server
 ```
 
 ---
 
 ## 5. Deep Dive: Each File Explained
 
-### 🧠 `bridge.py` — The Core Security Gateway (~1200 lines)
+### 🧠 [bridge.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py) — The Core Security Gateway (~2200 lines)
 
-**This is the most important file.** It's the heart of the entire project.
+This is the primary security gateway. It supports dual-transport modes:
+1. **Stdio Interception Mode:** Intercepts JSON-RPC tool requests between local agents (e.g., Claude Desktop) and Node.js tool executors.
+2. **HTTP Proxy Mode (FastAPI):** Exposes an OpenAI-compatible `/v1/chat/completions` endpoint at port `5001`. It intercepts prompt/response histories for chatbots like [main.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/damn-vulnerable-llm-agent/main.py).
 
-**What it does:** It sits between Claude Desktop (the AI) and the Node.js MCP server. Every message the AI sends goes through `bridge.py` first, gets inspected, and only if it passes all security checks does it reach the actual tool.
+#### Ingress Proxy pipeline checks:
+- **Inbound PII Redaction:** Extracts and redacts Email, SSN, Credit Cards, and Phone numbers from prompt strings *before* safety checks to avoid false positive guardrail blocks.
+- **NVIDIA NIM Llama Guard 4:** Evaluates conversational safety categories (e.g., prompt injections, jailbreaks, data exfiltration) with a local mock fallback.
+- **Topical Guardrails:** Blocks unauthorized categories defined in [mcp-firewall.yaml](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/mcp-firewall.yaml).
+- **Keycloak RBAC Checks:** Verifies user identity and roles. Ensures standard users cannot query or run tools for other user IDs (ID hijacking protection).
 
-**How it works (step by step):**
+#### Egress Proxy pipeline checks:
+- **Egress Buffering:** Collects streamed tokens from upstream LLMs (e.g., Hugging Face Llama 3.1) into a single buffer.
+- **Outbound Redaction:** Performs full regex scan on the buffered output to strip any leaked secrets before sending to client.
+- **Simulated Streaming:** Slowly streams the sanitized response to the client in 5-character chunks with `asyncio.sleep(0.01)` to preserve typing animation.
 
-1. **Startup:**
-   - Redirects stdout to stderr (so security logs don't corrupt the MCP protocol)
-   - Loads `.env` configuration
-   - Initializes the `Gateway` (firewall rule engine from `mcp-firewall.yaml`)
-   - Initializes the `FraudDetectionEngine`
-   - Initializes the `NIMCloudGuard` (NVIDIA AI guardrails)
-   - Starts the security dashboard on port 9090
-   - Launches multiple MCP server processes (Node.js) in sandboxed jails
-   - Starts 3 types of threads:
-     - **Input thread** — reads from AI agent, filters tool calls
-     - **Output threads** — reads from MCP servers, redacts PII
-     - **Stderr threads** — captures server error logs
-
-2. **When a tool call arrives** (e.g., AI says "read_file with path=../../etc/passwd"):
-   ```
-   AI → stdin → bridge.py INPUT THREAD
-      → Step 1: Verify JWT token (Keycloak)
-      → Step 2: Check scope (does token have "tool:read_file"?)
-      → Step 3: Exchange for JIT token (60-second, single-scope)
-      → Step 4: Check SPIFFE identity (workload auth)
-      → Step 5: Check role (guest/analyst/admin)
-      → Step 6: NVIDIA NeMo jailbreak detection
-      → Step 7: NVIDIA NeMo topical guardrails
-      → Step 8: Firewall rule check (mcp-firewall.yaml)
-      → Step 9: Fraud engine risk scoring
-      → If ALL pass: route to correct MCP server process
-      → If ANY fail: return JSON-RPC error to AI
-   ```
-
-3. **When a response comes back** from the MCP server:
-   ```
-   MCP Server → stdout → bridge.py OUTPUT THREAD
-      → Step 1: Validate it's valid JSON
-      → Step 2: NVIDIA NeMo PII redaction
-      → Step 3: Firewall response scanning
-      → Step 4: Regex-based email redaction (fallback)
-      → Send cleaned response back to AI agent
-   ```
-
-**Key Classes inside `bridge.py`:**
-
-| Class | Purpose |
-|-------|---------|
-| `FraudDetectionEngine` | Tracks per-agent risk scores. Increases score on denied/redacted actions. Auto-decays scores over time. Quarantines agents at score ≥ 100. |
-| `NIMCloudGuard` | Calls NVIDIA NIM API to check for jailbreak attempts, off-topic queries, and PII in text. |
-| `JWTVerifier` | Fetches JWKS keys from Keycloak and verifies JWT tokens. |
-| `JITTokenManager` | Implements RFC 8693 Token Exchange — converts broad user tokens into short-lived, minimal-scope JIT tokens. |
-| `BaseJailer` / `LandlockJailer` / `NSJailer` / `WindowsJailer` | Sandbox implementations for different OS platforms. |
-| `JailFactory` | Picks the right sandbox based on the OS. |
+#### Key Classes inside [bridge.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py):
+* [FraudDetectionEngine](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L63): Tracks risk scores per user/agent. Penalizes denied actions (+15) and PII redactions (+10). Features background score decay thread (-10 points per 30s) and quarantines agents at score $\ge 500$ (e.g. Honeypot traps yield instant $+100$ risk penalty).
+* [NIMCloudGuard](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L190): Interfaces with NVIDIA NIM to check for jailbreaks (`meta/llama-guard-4-12b`) and redacts PII.
+* [JWTVerifier](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L597): Fetches JWKS keys from Keycloak to verify user JWT signatures.
+* [JITTokenManager](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L627): Exchanges broad user tokens for short-lived (60s), single-scope JIT tokens (RFC 8693) before forwarding requests to isolated sandboxes.
+* [BaseJailer](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L302) / [LandlockJailer](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L321) / [NSJailer](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L341) / [WindowsJailer](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L368): Pluggable sandboxes that restrict filesystem and network capabilities depending on the host OS.
+* [JailFactory](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py#L379): Picks the correct process jailer depending on OS.
 
 ---
 
-### 📋 `mcp-firewall.yaml` — Firewall Rules
+### 📋 [mcp-firewall.yaml](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/mcp-firewall.yaml) — Policy Configuration
 
-This is the **policy configuration file**. It defines what's allowed and what's blocked.
-
-**Sections:**
-
-| Section | What It Configures |
-|---------|--------------------|
-| `global` | Dashboard port, audit log path, fail-open behavior |
-| `secrets` | Whether to redact secrets from responses |
-| `nemo_cloud` | NVIDIA NeMo guardrail settings (jailbreak, PII, topical) |
-| `zones` | Environment risk levels (production=critical, staging=medium, dev=low) |
-| `dynamic_blocks` | Auto-populated blocklist when users are quarantined |
-| `rules` | **The main firewall rules** — evaluated in order, first match wins |
-| `mcp_servers` | Registry of MCP server processes and their tools |
-
-**Key Rules Explained:**
-
-| Rule | What It Does |
-|------|-------------|
-| `redact-emails` | If any response contains an email (`.*@.*`), redact it |
-| `block-traversal` | Block `../../` path traversal attempts on file tools |
-| `block-admin-access` | Block access to `admin/` directory |
-| `allow-claude-files` | Allow AI to access `secure-experiment-zone/claude-desktop*` |
-| `allow-experiment-zone-access` | Allow AI to access anywhere in `secure-experiment-zone*` |
-| `block-unauthorized-fs` | Block ALL other filesystem access (defense in depth) |
-| `block-honeypots` | **Honeypot trap** — `get_system_config` and `fetch_internal_db` are fake tools. If AI tries them, it gets maximum fraud penalty (score +100 = instant quarantine) |
-| `allow-keycloak-tools` | Allow all `keycloak_*` tools |
+This defines the active policy engine parameters, risk zones, blocked topics, rules, and registers the compilation targets.
+* **Honeypot Trap rule (`block-honeypots`):** Maps fake tools (`get_system_config`, `fetch_internal_db`). Access attempts trigger instant critical fraud quarantines.
+* **General rules:** Standard directory checks (`block-traversal`, `block-admin-access`), sandbox workspace settings (`allow-experiment-zone-access`), and default fallbacks.
+* **Server Registry:** Maps `filesystem-provider` and `keycloak-provider` commands, paths, and tool scopes.
 
 ---
 
-### 📂 `src/index.ts` — MCP Server Entry Point
+### 🕵️ [audit_agent.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/audit_agent.py) — Asynchronous Telemetry Auditor
 
-Creates a Node.js MCP (Model Context Protocol) server using the official `@modelcontextprotocol/sdk`. Registers all tools and connects via stdio transport.
-
-**Flow:**
-```
-src/index.ts → imports tools.ts → registerTools(server) → server.connect(stdio)
-```
+Evaluates session transcript history using NIM Llama Guard 4.
+* **Embedded Mode:** Runs automatically as a background thread inside [bridge.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py) if `NVIDIA_API_KEY` is present. Updates the dashboard and increases agent risk scores dynamically on safety hits.
+* **Role-Awareness:** Adjusts category weights depending on active permissions (e.g., downgrading Code Interpreter category `S14` for authenticated administrators).
+* **Standalone Mode:** Can run as a separate process by running `python audit_agent.py`.
 
 ---
 
-### 📂 `src/tools/tools.ts` — All Tool Implementations
+### 📊 [telemetry.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/telemetry.py) — Telemetry Database Writer
 
-This file registers **10 tools** that the AI agent can use:
-
-| Tool Name | What It Does | Access Level |
-|-----------|-------------|--------------|
-| `read_file` | Reads a file from disk | Scope: `tool:read_file` |
-| `write_file` | Writes content to a file | Scope: `tool:write_file` |
-| `list_directory` | Lists contents of a directory | Scope: `tool:list_directory` |
-| `keycloak_list_users` | Lists all users in Keycloak | Role: analyst+ |
-| `keycloak_list_user_sessions` | Lists active sessions for a user | Role: analyst+ |
-| `keycloak_revoke_user_sessions` | Revokes all sessions for a user | Role: **admin only** |
-| `keycloak_get_user_events` | Gets audit events for a user | Role: guest+ |
-| `keycloak_security_report` | Generates security posture report from logs | Report tool |
-| `keycloak_generate_policy` | Generates firewall rules from learning mode discoveries | Report tool |
-| `keycloak_quarantine_user` | Revokes sessions AND adds user to dynamic blocklist | Role: **admin only** |
+Implements [TelemetryEventBus](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/telemetry.py#L28):
+* Utilizes a background thread and thread-safe queue (`process_queue`) to write alerts, requests, and metrics to SQLite (`telemetry.db`).
+* Prevents file lock conflicts on SQLite when logging events from high-concurrency connections.
 
 ---
 
-### 📂 `src/tools/rbac.ts` — Role-Based Access Control
+### 🤖 [damn-vulnerable-llm-agent/](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/damn-vulnerable-llm-agent/) — Chatbot Demo Application
 
-Small utility that:
-1. Decodes a JWT token to extract `realm_access.roles`
-2. Checks if the user's roles include any of the allowed roles
-
----
-
-### 📂 `src/tools/spiffeAuth.ts` — SPIFFE Identity Verification
-
-Handles **workload identity** (machine-to-machine authentication):
-1. Tries to connect to the SPIRE agent's Unix socket
-2. If available, fetches the SVID (SPIFFE Verifiable Identity Document)
-3. Extracts the SPIFFE ID (e.g., `spiffe://runtime-shield/bridge`)
-4. Validates it against the trust bundle
+An intentionally vulnerable banking chatbot designed to showcase security protections:
+* [main.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/damn-vulnerable-llm-agent/main.py): Sets up the Streamlit interface and integrates Langchain `ChatLiteLLM` with the Shield Proxy (`http://localhost:5001/v1`). It contains custom interceptors to parse API errors into beautiful warning blocks (e.g., **RBAC Violation**, **Jailbreak Detected**).
+* [tools.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/damn-vulnerable-llm-agent/tools.py): Exposes local ReAct tools `GetCurrentUser` and `GetUserTransactions`.
+* [transaction_db.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/damn-vulnerable-llm-agent/transaction_db.py): SQLite helper which seeds sample users (Marty, Doc, Biff) and transactions containing email patterns, flags, and card numbers.
 
 ---
 
-### 📂 `src/utils/keycloak.ts` — Keycloak Admin Client
+### 🚀 [run_shield_demo.sh](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/run_shield_demo.sh) — Integrated Demo Launcher
 
-Creates and authenticates a Keycloak admin client using `client_credentials` grant. This is how the MCP server talks to Keycloak's API.
-
----
-
-### 🕵️ `audit_agent.py` — Background AI Auditor
-
-A **separate process** that runs alongside the bridge. It:
-1. Monitors `bridge.log` for new entries
-2. Every 10 seconds, reads any new log data
-3. Sends it to **NVIDIA NIM** (Llama 3.1 70B) for AI-powered analysis
-4. The AI looks for: SSN leaks, password exposure, data exfiltration attempts
-5. Returns a safety score (0-10) and reason
-
-> [!IMPORTANT]
-> This runs independently of the bridge. You start it separately with `python audit_agent.py`.
+A shell script to start the complete system:
+1. Cleans up stale Python/Streamlit processes and deletes old telemetry databases.
+2. Activates the Python virtual environment and starts `bridge.py` in the background (logging output to `bridge_demo.log`).
+3. Waits for the proxy server to initialize on port `5001`.
+4. Starts the Streamlit agent chatbot on port `8501`.
+5. Automatically opens browser tabs for the **Shield Live Dashboard (Port 9090)** and the **Banking Chatbot (Port 8501)**.
 
 ---
 
-### 🔌 `shield_sdk.py` — Customer Integration SDK
+### 📦 [src/index.ts](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/src/index.ts) — Node.js MCP Server Entry Point
 
-A **lightweight SDK** that customers embed in their own chatbots. It:
-1. Takes a `tenant_id` to identify the customer
-2. Wraps tool calls into MCP JSON-RPC format
-3. Injects SSO tokens for identity-aware routing
-4. Routes the request to the Shield Bridge
-
-Think of it as "Shield-as-a-Service" — customers don't need to know MCP protocol.
+Creates the tool-execution server using `@modelcontextprotocol/sdk`.
+* Imports [tools.ts](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/src/tools/tools.ts) to register tool schemas.
+* Runs [verifySpiffeIdentity](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/src/tools/spiffeAuth.ts) on startup to verify its workload identity.
 
 ---
 
-### 🧪 `test_stub_execution.py` — SDK Demo
+### 📂 [src/tools/tools.ts](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/src/tools/tools.ts) — Tool Definitions
 
-Demonstrates how a customer chatbot would use `shield_sdk.py`:
-```python
-stub = ShieldStub(tenant_id="customer-delta-99")
-response = stub.call_tool("read_file", {"path": "C:/Windows/System32/drivers/etc/hosts"}, sso_token="eyJ...")
-```
-This shows the full flow: customer calls SDK → SDK wraps in MCP → Bridge verifies → JIT token exchange → tool executes in jail.
+Registers 10 tools mapping to Node.js/TypeScript execution:
+- **Filesystem Tools:** `read_file`, `list_directory`, `write_file`.
+- **Keycloak Admin Tools:** `keycloak_list_users`, `keycloak_list_user_sessions`, `keycloak_revoke_user_sessions` (admin only), `keycloak_get_user_events`, `keycloak_quarantine_user` (admin only).
+- **Report & Policy Tools:** `keycloak_security_report` (compiles audit logs), `keycloak_generate_policy` (converts discovery records to firewall YAML format).
 
 ---
 
-### ⚠️ `demo/vulnerable_mcp_actions.py` — Intentionally Vulnerable Server
+## 6. How Everything Connects (Data Flows)
 
-A **deliberately insecure** MCP server used for security testing/demos. It has:
-- **Path traversal vulnerability** — `get_full_path()` does naive `os.path.join()` without validating the path stays within the workspace
-- **Arbitrary code execution** — `execute_code` runs Python with no sandboxing
-- **Honeypot tools** — `get_system_config` and `fetch_internal_db` are traps
-
-> [!CAUTION]
-> This file is intentionally vulnerable for educational/testing purposes. NEVER use in production.
-
----
-
-### 📊 `dashboard_client.py` — Multi-Tenant Dashboard Client
-
-Handles **multi-tenant configuration** for the SaaS model:
-1. Fetches tenant-specific policies (which tools are allowed, which PII rules apply)
-2. Fetches vault secrets for specific tools (principle of least privilege)
-3. Currently uses mock data — the real API integration is a TODO
-
----
-
-### 📝 `claude_config.txt` — Claude Desktop Configuration
-
-This is the config you put in Claude Desktop's settings to register the Shield as an MCP server:
-```json
-{
-  "mcpServers": {
-    "Secure-Runtime-Shield": {
-      "command": "python.exe",
-      "args": ["bridge.py"]
-    }
-  }
-}
-```
-This tells Claude: "When you want to use tools, talk to `bridge.py` via stdio."
-
----
-
-### 🐳 `docker-compose.yml` — Infrastructure Services
-
-Starts 3 Docker containers:
-
-| Container | Image | Port | Purpose |
-|-----------|-------|------|---------|
-| `keycloak_mcp` | Keycloak 26.5.3 | 8080 | User authentication, RBAC, JWT tokens |
-| `spire-server` | SPIRE Server 1.8.0 | 8081 | SPIFFE identity authority (issues SVIDs) |
-| `spire-agent` | SPIRE Agent 1.8.0 | — | Local agent that provides workload identities |
-
----
-
-### 🪪 `spire/` — SPIFFE/SPIRE Configuration
-
-SPIFFE = Secure Production Identity Framework for Everyone. It gives **every workload a cryptographic identity**.
-
-| File | Purpose |
-|------|---------|
-| `server/server.conf` | SPIRE Server config — trust domain is `runtime-shield`, uses SQLite, x509 attestation |
-| `agent/agent.conf` | SPIRE Agent config — connects to server on port 8081, uses x509pop attestation |
-| `certs/ca.crt` + `ca.key` | Certificate Authority (root of trust) |
-| `certs/agent.crt` + `agent.key` | Agent's TLS certificate (signed by CA) |
-
----
-
-### 🧪 `secure-experiment-zone/` — Safe Sandbox
-
-This is the **only directory the AI agent is allowed to access**. The firewall rules restrict all file operations to this folder.
-
-| File | Purpose |
-|------|---------|
-| `claude-desktop/` | AI agent's personal workspace |
-| `generate_certs.py` | Utility to regenerate SPIRE certificates |
-| `search_events.py` | Helper script for event searching |
-| `test_sandbox.txt` | Test file to verify sandbox works |
-
----
-
-## 6. How Everything Connects
+### Stdio / Claude Desktop Mode
 
 ```mermaid
 sequenceDiagram
@@ -391,179 +248,81 @@ sequenceDiagram
     participant Fraud as 🕵️ Fraud Engine
     participant MCP as 📦 Node.js MCP Server
     participant FS as 📁 File System
-    participant Dash as 📊 Dashboard
 
     AI->>Bridge: tools/call: read_file {path: "../../etc/passwd"}
     Bridge->>KC: Verify JWT token
-    KC-->>Bridge: ✅ Token valid, user=analyst
-    Bridge->>Bridge: Check SPIFFE ID
-    Bridge->>Bridge: Check Role (analyst >= analyst ✅)
+    KC-->>Bridge: ✅ Token valid, role=user
+    Bridge->>Bridge: Verify SPIFFE identity
     Bridge->>FW: Check rules for read_file + path
     FW-->>Bridge: 🚫 DENY (matches block-traversal rule)
     Bridge->>Fraud: Report denied action
-    Fraud-->>Bridge: Risk score +15 (now 15/75)
-    Bridge->>Dash: Log event: BLOCKED
-    Bridge-->>AI: ❌ Error: "Security violation: Path traversal detected"
+    Fraud-->>Bridge: Risk score +15 (now 15)
+    Bridge-->>AI: ❌ Error: "Security violation: Potential directory traversal detected"
+```
+
+### HTTP Proxy Mode (Custom Chatbots)
+
+```mermaid
+sequenceDiagram
+    participant App as 💻 Streamlit Chatbot
+    participant Proxy as 🐍 bridge.py Proxy
+    participant NIM as 🛡️ NVIDIA NIM API
+    participant LLM as 🧠 Hugging Face Llama 3.1
     
-    Note over AI, Bridge: Next call...
-    
-    AI->>Bridge: tools/call: read_file {path: "secure-experiment-zone/test.txt"}
-    Bridge->>KC: Verify JWT
-    Bridge->>FW: Check rules
-    FW-->>Bridge: ✅ ALLOW (matches allow-experiment-zone-access)
-    Bridge->>MCP: Forward to filesystem-provider
-    MCP->>FS: Read file
-    FS-->>MCP: File contents (with user@example.com)
-    MCP-->>Bridge: Response with content
-    Bridge->>Bridge: Redact emails: user@example.com → [REDACTED]
-    Bridge->>Dash: Log event: REDACTED
-    Bridge-->>AI: File contents (emails scrubbed)
+    App->>Proxy: POST /v1/chat/completions (with Prompt containing email & CC)
+    Proxy->>Proxy: Inbound PII Redaction (swap values to placeholders)
+    Proxy->>NIM: Check jailbreak / safety (Llama Guard 4)
+    NIM-->>Proxy: ✅ Safe
+    Proxy->>Proxy: Verify user permissions & query constraints
+    Proxy->>LLM: Forward sanitized prompt
+    LLM-->>Proxy: Stream output chunks (containing user records)
+    Proxy->>Proxy: Buffer tokens until [DONE] signal received
+    Proxy->>Proxy: Outbound PII Redaction on full string
+    Proxy->>Proxy: Re-slice string into chunks
+    Proxy-->>App: Stream sanitized chunks with artificial delay
 ```
 
 ---
 
-## 7. Data Flow Summary
-
-### Request Path (AI → Tool)
-```
-Claude Desktop
-  ↓ (JSON-RPC over stdin)
-bridge.py INPUT THREAD
-  ↓ JWT Verification (Keycloak)
-  ↓ Scope Check
-  ↓ JIT Token Exchange (dowscope broad token → 60s single-scope token)
-  ↓ SPIFFE Identity Check
-  ↓ Role Check (guest < analyst < admin)
-  ↓ NeMo Jailbreak Detection
-  ↓ NeMo Topical Guardrails
-  ↓ Firewall Rule Matching (mcp-firewall.yaml)
-  ↓ Fraud Engine Risk Scoring
-  ↓ (if allowed) Route to correct MCP server process via tool_map
-Node.js MCP Server (dist/index.js)
-  ↓ Execute tool (read_file, keycloak_list_users, etc.)
-```
-
-### Response Path (Tool → AI)
-```
-Node.js MCP Server
-  ↓ (JSON response over stdout)
-bridge.py OUTPUT THREAD
-  ↓ Validate JSON
-  ↓ NeMo PII Redaction
-  ↓ Firewall Response Scan
-  ↓ Regex Email Redaction (fallback)
-  ↓ (cleaned response)
-Claude Desktop
-```
-
----
-
-## 8. Key Concepts Explained
+## 7. Key Concepts Explained
 
 ### MCP (Model Context Protocol)
-A protocol that lets AI agents use "tools". It uses **JSON-RPC 2.0** over **stdio** (standard input/output). The AI sends a JSON request, the server responds with a JSON result.
+An open standard that allows AI agents to interact with tools using **JSON-RPC 2.0** messages over stdio.
 
-### Zero Trust
-"Never trust, always verify." Even though the AI agent and the MCP server are on the same machine, every single tool call is verified for identity, authorization, and policy compliance.
-
-### RBAC (Role-Based Access Control)
-Three roles with increasing privileges:
-- **guest** (level 1) — can only read events
-- **analyst** (level 2) — can list users/sessions
-- **admin** (level 3) — can revoke sessions, quarantine users
+### JIT Token Exchange (RFC 8693)
+To prevent compromised tool servers from gaining full database access, the bridge swaps the user's broad OAuth token for a JIT token scoped *only* to the specific tool being requested. This token expires automatically after 60 seconds.
 
 ### Honeypot Traps
-Fake tools (`get_system_config`, `fetch_internal_db`) that look tempting to attackers. If the AI tries to use them, it gets **instant quarantine** (fraud score = +100).
+Fake tools registered in policy definitions (`get_system_config`, `fetch_internal_db`). AI models or attackers trying to list/invoke these tools trigger immediate quarantines.
 
 ### Learning Mode
-Run with `python bridge.py --learning` — the shield logs what WOULD be blocked but doesn't actually block anything. Used to discover what rules you need before enforcing them.
-
-### JIT Token Exchange
-When a user sends a broad token (access to everything), the bridge exchanges it for a **Just-In-Time token** that only has access to the specific tool being called, and expires in 60 seconds. Even if the sandbox is compromised, the attacker gets a nearly useless token.
+Can be toggled via CLI (`python bridge.py --learning`) or the `.env` configuration file. Unknown or blocked tools are logged into `discovery.log` for future rule generation instead of being dropped.
 
 ---
 
-## 9. How to Run the Project
-
-### On macOS / Linux (Recommended)
-
-```bash
-# 1. Start Keycloak + SPIRE Infrastructure
-docker-compose up -d
-
-# 2. Set up Python Virtual Environment (venv) & Install Packages
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# 3. Install Node.js dependencies and Compile TypeScript
-# (A clean reinstall is recommended on macOS to avoid Gatekeeper / "Operation not permitted" warnings)
-rm -rf node_modules
-npm install
-npm run build
-
-# 4. Run the security bridge
-python bridge.py
-
-# 5. (Optional) Run the audit agent in a separate terminal
-# Remember to activate your venv in that terminal first!
-python audit_agent.py
-
-# 6. View the live dashboard
-# Open http://localhost:9090 in your browser
-```
-
-### On Windows
-
-```bash
-# 1. Start Infrastructure
-docker-compose up -d
-
-# 2. Setup Python Virtual Environment (venv) & Install Packages
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-
-# 3. Install Node.js & compile TypeScript
-npm install
-npm run build
-
-# 4. Run the security bridge
-python bridge.py
-
-# 5. (Optional) Run the audit agent
-python audit_agent.py
-```
-
-### To use with Claude Desktop:
-Copy the config from `claude_config.txt` into Claude Desktop's MCP server settings.
-
----
-
-## 10. Technology Stack
+## 8. Technology Stack
 
 | Tech | Used For |
 |------|---------|
-| **Python 3.10+** | Security bridge, fraud engine, audit agent |
-| **Node.js / TypeScript** | MCP server with tools (Keycloak + filesystem) |
-| **Keycloak** | Identity management, JWT tokens, RBAC |
-| **SPIFFE/SPIRE** | Workload identity (machine-to-machine auth) |
-| **NVIDIA NeMo NIM** | AI-powered jailbreak detection and PII redaction |
-| **Docker Compose** | Container orchestration for Keycloak + SPIRE |
-| **MCP Protocol** | Standard for AI-tool communication |
-| **mcp-firewall SDK** | Policy engine for tool call filtering |
+| **Python 3.10+** | Security bridge gateway, FastAPI HTTP Proxy, Fraud engine, Telemetry bus |
+| **Node.js / TypeScript** | MCP server implementing tool execution logic |
+| **Keycloak** | Identity provider, JWKS signing keys, and RBAC authentication |
+| **SPIFFE/SPIRE** | Workload identity attestation for tool components |
+| **NVIDIA NeMo NIM** | Safety classifier (`llama-guard-4-12b`) for prompt auditing |
+| **Docker Compose** | Container orchestrator for Keycloak and SPIRE services |
+| **Langchain / LiteLLM** | ReAct agent framework in the demonstration client |
+| **Streamlit** | Chatbot UI and live security stats dashboard |
 
 ---
 
-## 11. Quick Reference: "What File Do I Edit For X?"
+## 9. Quick Reference: "What File Do I Edit For X?"
 
-| I want to... | Edit this file |
-|--------------|---------------|
-| Add/change firewall rules | `mcp-firewall.yaml` (rules section) |
-| Add a new tool | `src/tools/tools.ts` + rebuild with `npm run build` |
-| Change role requirements | `bridge.py` (TOOL_ROLE_POLICY dict) |
-| Change Keycloak connection | `.env` file |
-| Adjust fraud detection thresholds | `bridge.py` (FraudDetectionEngine class) |
-| Modify SPIFFE trust settings | `.env` + `spire/server/server.conf` |
-| Change dashboard port | `.env` (DASHBOARD_PORT) |
-| Add NVIDIA NIM guardrails | `mcp-firewall.yaml` (nemo_cloud section) |
+| Action | File |
+|---|---|
+| Edit or add firewall policies | [mcp-firewall.yaml](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/mcp-firewall.yaml) |
+| Add new Node.js MCP tools | [src/tools/tools.ts](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/src/tools/tools.ts) (rebuild via `npm run build`) |
+| Edit the fraud engine threshold/decay | [bridge.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/bridge.py) (inside `FraudDetectionEngine`) |
+| Change API ports or credentials | [.env](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/.env) |
+| Customize the chatbot UI or agent flow | [damn-vulnerable-llm-agent/main.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/damn-vulnerable-llm-agent/main.py) |
+| Adjust Llama Guard category severity | [audit_agent.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/audit_agent.py) (inside `_parse_guard_response`) |
+| Modify telemetry database columns | [telemetry.py](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/telemetry.py) + [schema_v2.sql](file:///Users/jashan/Documents/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/mcp_firewall/schema/schema_v2.sql) |
