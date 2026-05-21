@@ -12,7 +12,7 @@ export async function verifySpiffeIdentity(): Promise<{
     spiffe_id?: string;
     error?: string;
 }> {
-    const socketPath = process.env.SPIRE_AGENT_SOCKET || "C:\\ProgramData\\spire\\agent\\public\\api.sock";
+    const socketPath = process.env.SPIRE_AGENT_SOCKET || (process.platform === "win32" ? "C:\\ProgramData\\spire\\agent\\public\\api.sock" : "/tmp/spire-agent/public/api.sock");
     const bundlePath = process.env.SPIFFE_BUNDLE_PATH || "";
 
     // Check if SPIRE agent is available
@@ -110,6 +110,6 @@ async function validateSVIDAgainstBundle(svidData: Buffer, bundlePath: string): 
 }
 
 export default function verifySpiffeIdentitySync(): boolean {
-    const socketPath = process.env.SPIRE_AGENT_SOCKET || "C:\\ProgramData\\spire\\agent\\public\\api.sock";
+    const socketPath = process.env.SPIRE_AGENT_SOCKET || (process.platform === "win32" ? "C:\\ProgramData\\spire\\agent\\public\\api.sock" : "/tmp/spire-agent/public/api.sock");
     return fs.existsSync(socketPath);
 }

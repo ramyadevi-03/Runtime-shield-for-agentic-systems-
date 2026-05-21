@@ -86,5 +86,5 @@ def generate_certs(output_dir):
     print(f"✅ Certificates generated in {output_dir}")
 
 if __name__ == "__main__":
-    # Fixed path for the active workspace
-    generate_certs(r"c:\Users\Lenovo\Desktop\Runtime-shield- login\Runtime-shield-for-agentic-systems\spire\certs")
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    generate_certs(os.path.join(current_dir, "spire", "certs"))

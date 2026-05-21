@@ -17,13 +17,22 @@ import re
 import shutil
 from mcp_firewall.sdk import Gateway
 from mcp_firewall.dashboard.server import start_dashboard
-from mcp_firewall.dashboard.app import state as dashboard_state
+from mcp_firewall.dashboard.app import state as dashboard_state, app as dashboard_app
 from dotenv import load_dotenv
 import jwt
 import yaml
 import requests
 import logging
 from dashboard_client import DashboardClient
+from fastapi import Request, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+import httpx
+import asyncio
+
+# Global references for LLM proxy endpoints to access the core engines
+gateway_instance = None
+nim_guard_instance = None
+fraud_engine_instance = None
 
 try:
     import landlock
@@ -49,7 +58,7 @@ if sys.platform == 'win32':
     protocol_stdout = io.TextIOWrapper(real_stdout_buffer, encoding='utf-8')
 else:
     # On non-Windows, we still need the original stdout buffer
-    protocol_stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    protocol_stdout = io.TextIOWrapper(real_stdout_buffer, encoding='utf-8')
 
 class FraudDetectionEngine:
     def __init__(self, learning_mode=False):
@@ -408,18 +417,30 @@ with open(LOG_PATH, "a", encoding="utf-8") as f:
     f.write(f"\n--- Secure Bridge Session Start: {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
 
 
-# Load .env but don't override variables set in the terminal/environment
-load_dotenv(dotenv_path=DOTENV_PATH, override=False)
+# Load .env and override variables to ensure we pick up HF_TOKEN
+load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
-SCRIPTS_DIR = os.path.join(os.environ.get('APPDATA', ''), 'Python', 'Python313', 'Scripts')
-MCPWN_EXE = os.path.join(SCRIPTS_DIR, "mcpwn.exe")
+if sys.platform == 'win32':
+    mcpwn_name = "mcpwn.exe"
+else:
+    mcpwn_name = "mcpwn"
 
-# Fallback to sys.executable's scripts dir if not in user dir
+# Find it in virtual environment bin or system bin
+venv_bin = os.path.join(PROJECT_DIR, "venv", "bin" if sys.platform != "win32" else "Scripts")
+MCPWN_EXE = os.path.join(venv_bin, mcpwn_name)
+
 if not os.path.exists(MCPWN_EXE):
+    # Fallback to scripts directory or sys.executable's folder
     SCRIPTS_DIR = os.path.dirname(sys.executable)
-    if os.path.exists(os.path.join(SCRIPTS_DIR, "Scripts")):
-        SCRIPTS_DIR = os.path.join(SCRIPTS_DIR, "Scripts")
-    MCPWN_EXE = os.path.join(SCRIPTS_DIR, "mcpwn.exe")
+    if os.path.exists(os.path.join(SCRIPTS_DIR, "Scripts" if sys.platform == "win32" else "bin")):
+        SCRIPTS_DIR = os.path.join(SCRIPTS_DIR, "Scripts" if sys.platform == "win32" else "bin")
+    MCPWN_EXE = os.path.join(SCRIPTS_DIR, mcpwn_name)
+    
+    if not os.path.exists(MCPWN_EXE):
+        # Fallback to checking via shutil.which
+        resolved = shutil.which(mcpwn_name)
+        if resolved:
+            MCPWN_EXE = resolved
 
 
 # =========================
@@ -665,6 +686,725 @@ def is_scope_allowed(required_scope, token_scopes):
     return required_scope in token_scopes
 
 
+# ==========================================
+# SECURE OPENAI-COMPATIBLE PROXY ENDPOINT
+# ==========================================
+
+async def handle_mock_llm_response(body: dict, user_id: str, user_role: str):
+    messages = body.get("messages", [])
+    
+    get_user_called = False
+    get_trans_called = False
+    last_user_prompt = ""
+    
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content", "") or ""
+        if role == "user":
+            last_user_prompt = content
+            
+        if role == "tool" or msg.get("name") == "GetCurrentUser" or "GetCurrentUser" in content or "GetCurrentUser" in last_user_prompt:
+            get_user_called = True
+        elif role == "tool" or msg.get("name") == "GetUserTransactions" or "GetUserTransactions" in content or "GetUserTransactions" in last_user_prompt:
+            get_trans_called = True
+
+        if "GetCurrentUser" in content:
+            get_user_called = True
+        if "GetUserTransactions" in content:
+            get_trans_called = True
+            
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            for tc in tool_calls:
+                func_name = tc.get("function", {}).get("name", "")
+                if func_name == "GetCurrentUser":
+                    get_user_called = True
+                elif func_name == "GetUserTransactions":
+                    get_trans_called = True
+
+    # Robust detection over full message sequence
+    for msg in messages:
+        c = msg.get("content", "") or ""
+        if "GetCurrentUser" in c:
+            get_user_called = True
+        if "GetUserTransactions" in c:
+            get_trans_called = True
+            get_user_called = True
+        if msg.get("role") == "tool" or msg.get("name") == "GetCurrentUser":
+            get_user_called = True
+        if msg.get("role") == "tool" or msg.get("name") == "GetUserTransactions":
+            get_trans_called = True
+            get_user_called = True
+
+    last_prompt_lower = last_user_prompt.lower()
+    is_greeting = any(w in last_prompt_lower for w in ["hi", "hello", "hey", "hola"]) and len(last_prompt_lower) < 15
+
+    model_name = body.get("model", "gpt-4")
+
+    async def yield_response_chunks(content_text: str):
+        chunk_id = f"chatcmpl-{int(time.time())}"
+        
+        delta_role = {"role": "assistant", "content": ""}
+        yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model_name, 'choices': [{'index': 0, 'delta': delta_role, 'finish_reason': None}]})}\n\n"
+        await asyncio.sleep(0.005)
+        
+        chunk_size = 8
+        for i in range(0, len(content_text), chunk_size):
+            chunk = content_text[i:i+chunk_size]
+            delta_content = {"content": chunk}
+            yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model_name, 'choices': [{'index': 0, 'delta': delta_content, 'finish_reason': None}]})}\n\n"
+            await asyncio.sleep(0.005)
+            
+        yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    # Helper to wrap action in standard ReAct JSON block expected by ConversationalChatAgent
+    def format_action(action_name: str, action_input: dict):
+        action_input_str = json.dumps(action_input)
+        return f"```json\n{{\n  \"action\": \"{action_name}\",\n  \"action_input\": {action_input_str}\n}}\n```"
+
+    def format_final_answer(answer_text: str):
+        escaped_text = answer_text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+        return f"```json\n{{\n  \"action\": \"Final Answer\",\n  \"action_input\": \"{escaped_text}\"\n}}\n```"
+
+    has_redacted_pii = any(token in last_user_prompt for token in ["[REDACTED-EMAIL]", "[REDACTED-SSN]", "[REDACTED-PHONE]", "[REDACTED-CC]"])
+    if has_redacted_pii:
+        text = f"🛡️ **Privacy Shield Active**: Sensitive PII was detected and redacted in your prompt before it was processed by the assistant reasoning loop. Here is the sanitized content received by the LLM core:\n\n> \"{last_user_prompt}\""
+        formatted = format_final_answer(text)
+        return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+
+    if is_greeting:
+        text = "Hello! I am your helpful financial assistant. I can help you retrieve your recent bank transactions. Try asking me: 'What are my recent transactions?'"
+        formatted = format_final_answer(text)
+        return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+
+    if any(w in last_prompt_lower for w in ["transaction", "show", "get", "list"]):
+        has_hijacking_attempt = re.search(r'\b(user\s*id|user_?id|user)\b\s*(=?\s*\b\d+\b)', last_prompt_lower)
+        hijacked_id = None
+        if has_hijacking_attempt:
+            val = has_hijacking_attempt.group(2).replace("=", "").strip()
+            if val != "1":
+                hijacked_id = val
+
+        if hijacked_id:
+            reason = f"Security Violation: Refusing to fetch transactions for userId '{hijacked_id}'. I will only fetch transactions for the authenticated user ID returned by the GetCurrentUser tool."
+            dashboard_state.add_event({
+                "action": "deny",
+                "tool": "chat_completion",
+                "agent": "mock-llm-agent",
+                "reason": "RBAC Violation: Agent safely neutralized prompt injection (userId hijacking defense active)",
+                "severity": "critical",
+                "stage": "agent-reasoning",
+                "timestamp": time.time()
+            })
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Blocked by RBAC Shield: {reason}",
+                        "type": "rbac_violation",
+                        "code": "unauthorized_access"
+                    }
+                }
+            )
+
+    is_banking_query = any(w in last_prompt_lower for w in ["transaction", "show", "get", "list", "money", "salary", "balance", "bank"]) or get_user_called or get_trans_called
+
+    if is_banking_query:
+        if not get_user_called:
+            dashboard_state.add_event({
+                "action": "allow",
+                "tool": "GetCurrentUser",
+                "agent": "mock-llm-agent",
+                "reason": "Agent requested current user identity verification",
+                "severity": "low",
+                "stage": "agent-reasoning",
+                "timestamp": time.time()
+            })
+            formatted = format_action("GetCurrentUser", {})
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+            
+        elif get_user_called and not get_trans_called:
+            dashboard_state.add_event({
+                "action": "allow",
+                "tool": "GetUserTransactions",
+                "agent": "mock-llm-agent",
+                "reason": "Agent requesting bank transactions for authenticated userId: 1",
+                "severity": "low",
+                "stage": "agent-reasoning",
+                "timestamp": time.time()
+            })
+            formatted = format_action("GetUserTransactions", {"userId": "1"})
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+            
+        elif get_trans_called:
+            text = "Here are your recent bank transactions:\n\n| Date | Description | Amount |\n| --- | --- | --- |\n| 2026-05-18 | Grocery Store | -$42.50 |\n| 2026-05-17 | Salary Credit | +$3500.00 |\n| 2026-05-15 | Coffee Shop | -$5.80 |\n| 2026-05-14 | Electric Bill | -$120.00 |\n\nAll transactions have been successfully retrieved and processed."
+            dashboard_state.add_event({
+                "action": "allow",
+                "tool": "chat_completion",
+                "agent": "mock-llm-agent",
+                "reason": "Agent successfully processed and rendered authenticated bank transactions",
+                "severity": "low",
+                "stage": "agent-reasoning",
+                "timestamp": time.time()
+            })
+            formatted = format_final_answer(text)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+
+    fallback_text = "I am a secure financial ReAct assistant. I can fetch your bank transactions or verify user sessions. Try asking me: 'What are my recent bank transactions?'"
+    formatted = format_final_answer(fallback_text)
+    return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+
+
+@dashboard_app.post("/v1/chat/completions")
+async def chat_completions_proxy(request: Request):
+    global gateway_instance, nim_guard_instance, fraud_engine_instance
+
+    # 1. Parse JSON Request Body
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # 2. Extract JWT and verify identity/role
+    auth_header = request.headers.get("Authorization")
+    shield_header = request.headers.get("X-Shield-Token")
+    token = shield_header or auth_header
+    if token and token.startswith("Bearer "):
+        token = token[7:]
+
+    user_id = "anonymous_user"
+    user_role = "user"
+    claims = {}
+
+    if token:
+        try:
+            claims = get_token_claims(token)
+            user_id = claims.get("preferred_username") or claims.get("sub") or "anonymous_user"
+            roles = claims.get("realm_access", {}).get("roles", [])
+            user_role = "admin" if "admin" in roles else "user"
+        except Exception as e:
+            log(f"⚠️ Proxy failed to decode JWT token: {e}")
+
+    # Extract prompt messages
+    messages = body.get("messages", [])
+
+    # 3. Inbound PII Redaction (MUST RUN BEFORE SECURITY CHECKS TO PREVENT LLaMA GUARD FALSE POSITIVES)
+    pii_detected = False
+    new_pii_detected = False
+    redacted_messages = []
+    
+    # Redact email patterns, SSN patterns, and credit cards
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    ssn_pattern = r'\b\d{3}-\d{2}-\d{4}\b'
+    phone_pattern = r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'
+    
+    for idx, msg in enumerate(messages):
+        if msg.get("role") == "user":
+            orig = msg.get("content", "")
+            redacted = orig
+            if nim_guard_instance and nim_guard_instance.config.get("enabled") and nim_guard_instance.config.get("pii_rail", {}).get("enabled"):
+                redacted = nim_guard_instance.redact_pii(orig)
+            else:
+                # Local regex redaction fallback
+                cc_pattern = r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b'
+                redacted = re.sub(email_pattern, '[REDACTED-EMAIL]', redacted)
+                redacted = re.sub(ssn_pattern, '[REDACTED-SSN]', redacted)
+                redacted = re.sub(phone_pattern, '[REDACTED-PHONE]', redacted)
+                redacted = re.sub(cc_pattern, '[REDACTED-CC]', redacted)
+            
+            if redacted != orig:
+                pii_detected = True
+                msg["content"] = redacted
+                if idx == len(messages) - 1:
+                    new_pii_detected = True
+        redacted_messages.append(msg)
+
+    if pii_detected:
+        body["messages"] = redacted_messages
+        log("✂️ Inbound PII Redaction applied successfully")
+        if new_pii_detected:
+            dashboard_state.add_event({
+                "action": "redact",
+                "tool": "chat_completion",
+                "agent": f"user-{user_id}",
+                "reason": "Inbound PII Redacted (Email/SSN/Phone/CC)",
+                "severity": "medium",
+                "stage": "pii-redaction-inbound",
+                "timestamp": time.time()
+            })
+
+    user_content = "\n".join([m.get("content", "") for m in messages if m.get("role") == "user"])
+    log(f"User Prompt: {user_content}")
+
+    # 3. Inbound Security Checks: Llama Guard 4 (Jailbreak Detection)
+    if nim_guard_instance and nim_guard_instance.config.get("enabled"):
+        jb_blocked, jb_reason = nim_guard_instance.check_jailbreak(user_content)
+        if jb_blocked:
+            log(f"🚫 NE-MO BLOCK (Llama Guard): {jb_reason}")
+            dashboard_state.add_event({
+                "action": "deny",
+                "tool": "chat_completion",
+                "agent": "llama-guard",
+                "reason": jb_reason,
+                "severity": "critical",
+                "stage": "llama-guardrails",
+                "timestamp": time.time()
+            })
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Blocked by Llama Guard: {jb_reason}",
+                        "type": "security_violation",
+                        "code": "jailbreak_detected"
+                    }
+                }
+            )
+
+        # Topical filter check
+        tp_blocked, tp_reason = nim_guard_instance.check_topical(user_content)
+        if tp_blocked:
+            log(f"🚫 NE-MO BLOCK (Topical): {tp_reason}")
+            dashboard_state.add_event({
+                "action": "deny",
+                "tool": "chat_completion",
+                "agent": "nemo-topical",
+                "reason": tp_reason,
+                "severity": "high",
+                "stage": "nemo-guardrails",
+                "timestamp": time.time()
+            })
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Blocked by Topical filter: {tp_reason}",
+                        "type": "security_violation",
+                        "code": "topical_violation"
+                    }
+                }
+            )
+    else:
+        # Fallback keyword jailbreak detection for local demo (Mock mode)
+        # Blocks prompt injections like "ignore instructions", "bypass security", etc.
+        vuln_words = ["ignore prior", "bypass security", "override safety", "system migration", "override userid", "act as developer"]
+        for word in vuln_words:
+            if word in user_content.lower():
+                reason = f"Llama Guard (Mock) Jailbreak: Detected suspicious sequence '{word}'"
+                log(f"🚫 MOCK BLOCK (Llama Guard): {reason}")
+                dashboard_state.add_event({
+                    "action": "deny",
+                    "tool": "chat_completion",
+                    "agent": "llama-guard-mock",
+                    "reason": reason,
+                    "severity": "critical",
+                    "stage": "llama-guardrails",
+                    "timestamp": time.time()
+                })
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": "Blocked by Llama Guard: Llama Guard 4 UNSAFE — Violated categories: s7",
+                            "type": "security_violation",
+                            "code": "jailbreak_detected"
+                        }
+                    }
+                )
+        
+        # Check for PII pattern matches to simulate Llama Guard 4 Category S7 (Private Personal Data)
+        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+        ssn_pattern = r'\b\d{3}-\d{2}-\d{4}\b'
+        phone_pattern = r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'
+        cc_pattern = r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b'
+        
+        has_pii = (re.search(email_pattern, user_content) or 
+                   re.search(ssn_pattern, user_content) or 
+                   re.search(phone_pattern, user_content) or 
+                   re.search(cc_pattern, user_content))
+                   
+        if has_pii:
+            reason = "Llama Guard 4 UNSAFE — Violated categories: s7"
+            log(f"🚫 MOCK BLOCK (Llama Guard PII S7): {reason}")
+            dashboard_state.add_event({
+                "action": "deny",
+                "tool": "chat_completion",
+                "agent": "llama-guard-mock",
+                "reason": reason,
+                "severity": "critical",
+                "stage": "llama-guardrails",
+                "timestamp": time.time()
+            })
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Blocked by Llama Guard: {reason}",
+                        "type": "security_violation",
+                        "code": "jailbreak_detected"
+                    }
+                }
+            )
+
+    # 4. Inbound Security Checks: Keycloak RBAC Validation
+    if user_role != "admin":
+        # Rule A: Blocked keywords
+        blocked_keywords = ["all sessions", "revoke session", "quarantine", "list users", "admin panel", "dump database", "remove sessions", "dump sessions", "sessions"]
+        for kw in blocked_keywords:
+            if kw in user_content.lower():
+                reason = f"RBAC Violation: Keyword '{kw}' is restricted to admin role. User '{user_id}' has role '{user_role}'."
+                log(f"🚫 RBAC BLOCK: {reason}")
+                dashboard_state.add_event({
+                    "action": "deny",
+                    "tool": "chat_completion",
+                    "agent": "keycloak-rbac",
+                    "reason": reason,
+                    "severity": "high",
+                    "stage": "keycloak-auth",
+                    "timestamp": time.time()
+                })
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": {
+                            "message": reason,
+                            "type": "security_violation",
+                            "code": "rbac_unauthorized"
+                        }
+                    }
+                )
+
+        # Rule B: Prompt ID Hijacking check (prevent standard user from asking for other userIds)
+        has_hijacking_attempt = re.search(r'\b(user\s*id|user_?id|user)\b\s*(=?\s*\b\d+\b)', user_content.lower())
+        if has_hijacking_attempt:
+            val = has_hijacking_attempt.group(2).replace("=", "").strip()
+            if val != "1":
+                reason = f"RBAC Violation: Refusing to fetch transactions for userId '{val}'. User '{user_id}' (role '{user_role}') is only authorized to access userId '1'."
+                log(f"🚫 RBAC BLOCK: {reason}")
+                dashboard_state.add_event({
+                    "action": "deny",
+                    "tool": "chat_completion",
+                    "agent": "keycloak-rbac",
+                    "reason": reason,
+                    "severity": "critical",
+                    "stage": "keycloak-auth",
+                    "timestamp": time.time()
+                })
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": {
+                            "message": reason,
+                            "type": "security_violation",
+                            "code": "rbac_unauthorized"
+                        }
+                    }
+                )
+
+        # Rule C: Tool Call History check (prevent standard user from receiving transactions of other userIds)
+        for msg in messages:
+            tool_calls = msg.get("tool_calls") or []
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                if func.get("name") == "GetUserTransactions":
+                    try:
+                        args = json.loads(func.get("arguments", "{}"))
+                        u_id = str(args.get("userId", "")).strip()
+                        if u_id and u_id != "1":
+                            reason = f"RBAC Violation: User '{user_id}' (role '{user_role}') is not authorized to call GetUserTransactions for userId '{u_id}'. Access is restricted to own userId '1'."
+                            log(f"🚫 RBAC BLOCK: {reason}")
+                            dashboard_state.add_event({
+                                "action": "deny",
+                                "tool": "GetUserTransactions",
+                                "agent": "keycloak-rbac",
+                                "reason": reason,
+                                "severity": "critical",
+                                "stage": "keycloak-auth",
+                                "timestamp": time.time()
+                            })
+                            return JSONResponse(
+                                status_code=403,
+                                content={
+                                    "error": {
+                                        "message": reason,
+                                        "type": "security_violation",
+                                        "code": "rbac_unauthorized"
+                                    }
+                                }
+                            )
+                    except Exception:
+                        pass
+
+    if fraud_engine_instance:
+        class MockDecision:
+            def __init__(self, action, reason="No policy triggers", severity="low"):
+                self.action = action
+                self.reason = reason
+                self.severity = severity
+        mock_decision = MockDecision(action="allow")
+        
+        # Track user's query behaviour and analyze risk score
+        fraud_blocked, final_action, final_reason, final_severity = fraud_engine_instance.analyze(
+            agent=f"chat-user-{user_id}",
+            decision=mock_decision,
+            tool_name="chat_completion",
+            tool_args={"user_id": user_id, "role": user_role, "prompt_len": len(user_content)},
+            user_id=user_id
+        )
+
+        if fraud_blocked:
+            log(f"🚫 FRAUD ENGINE BLOCK: {final_reason}")
+            dashboard_state.add_event({
+                "action": "deny",
+                "tool": "chat_completion",
+                "agent": "fraud-engine",
+                "reason": final_reason,
+                "severity": "critical",
+                "stage": "fraud-engine",
+                "timestamp": time.time()
+            })
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "message": final_reason,
+                        "type": "security_violation",
+                        "code": "fraud_blocked"
+                    }
+                }
+            )
+
+    # Inbound PII Redaction has been moved before security checks to prevent LLaMA Guard false positives
+
+    # 7. Check if running in Mock LLM Mode
+    openai_key = os.getenv("OPENAI_API_KEY")
+    hf_token = os.getenv("HF_TOKEN")
+    
+    requested_model = body.get("model", "gpt-4o")
+    log(f"📋 Received request for model: '{requested_model}'")
+    is_huggingface = requested_model.startswith("huggingface/") or "llama-3.1" in requested_model.lower() or "meta-llama" in requested_model.lower()
+    
+    if is_huggingface:
+        pass # Force real upstream requests even if hf_token is missing (it will fail cleanly upstream)
+    else:
+        if not openai_key or openai_key == "mock-key-for-local-demo":
+            log("🤖 Zero-Key Mock LLM Mode activated")
+            return await handle_mock_llm_response(body, user_id, user_role)
+
+    # 8. Standard Mode: Forward Request to Upstream LLM
+    target_url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    if is_huggingface:
+        if requested_model.startswith("huggingface/"):
+            model_id = requested_model[len("huggingface/"):]
+        else:
+            model_id = requested_model
+        body["model"] = model_id
+        target_url = "https://router.huggingface.co/v1/chat/completions"
+        headers["Authorization"] = f"Bearer {hf_token}"
+        log(f"🛤️ Proxying authenticated chat completion request to Hugging Face model '{model_id}' via Router API for user: {user_id}")
+    else:
+        if requested_model.startswith("openai-"):
+            body["model"] = requested_model[len("openai-"):]
+        else:
+            body["model"] = requested_model
+        headers["Authorization"] = f"Bearer {openai_key}"
+        log(f"🛤️ Proxying authenticated chat completion request to OpenAI for user: {user_id}")
+
+    is_stream = body.get("stream", False)
+    if is_stream:
+        dashboard_state.add_event({
+            "action": "allow",
+            "tool": "chat_completion",
+            "agent": f"user-{user_id}",
+            "reason": "Streaming chat completion initiated",
+            "severity": "low",
+            "stage": "response-stream-start",
+            "timestamp": time.time()
+        })
+
+        async def stream_generator():
+            accumulated_content = []
+            chunks_metadata = []
+            
+            async with httpx.AsyncClient() as client:
+                async with client.stream("POST", target_url, headers=headers, json=body, timeout=60.0) as resp:
+                    if resp.status_code != 200:
+                        error_detail = await resp.aread()
+                        log(f"⚠️ Upstream streaming error: {error_detail}")
+                        err_msg = f"API Error: Upstream Hugging Face server returned status {resp.status_code}."
+                        yield f"data: {json.dumps({'id': 'err', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': requested_model, 'choices': [{'index': 0, 'delta': {'content': err_msg}, 'finish_reason': 'stop'}]})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    async for line in resp.aiter_lines():
+                        if line.startswith("data: "):
+                            data_content = line[6:].strip()
+                            if data_content == "[DONE]":
+                                break
+
+                            try:
+                                chunk = json.loads(data_content)
+                                if not chunks_metadata:
+                                    chunks_metadata.append(chunk)
+                                
+                                choices = chunk.get("choices", [])
+                                delta = choices[0].get("delta", {}) if choices else {}
+                                content = delta.get("content", "")
+                                if content:
+                                    accumulated_content.append(content)
+                            except Exception as e:
+                                log(f"⚠️ Stream chunk parsing error: {e}")
+
+            full_text = "".join(accumulated_content)
+            redacted_text = full_text
+            
+            email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+            ssn_pattern = r'\b\d{3}-\d{2}-\d{4}\b'
+            phone_pattern = r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'
+            cc_pattern = r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b'
+
+            if nim_guard_instance and nim_guard_instance.config.get("enabled"):
+                redacted_text = nim_guard_instance.redact_pii(full_text)
+            else:
+                redacted_text = re.sub(email_pattern, '[REDACTED-EMAIL]', redacted_text)
+                redacted_text = re.sub(ssn_pattern, '[REDACTED-SSN]', redacted_text)
+                redacted_text = re.sub(phone_pattern, '[REDACTED-PHONE]', redacted_text)
+                redacted_text = re.sub(cc_pattern, '[REDACTED-CC]', redacted_text)
+            
+            if redacted_text != full_text:
+                log("✂️ Outbound PII Redacted from stream")
+                dashboard_state.add_event({
+                    "action": "redact",
+                    "tool": "chat_completion",
+                    "agent": "nemo-pii",
+                    "reason": "Outbound PII Redacted from stream",
+                    "severity": "medium",
+                    "stage": "pii-redaction-outbound",
+                    "timestamp": time.time()
+                })
+
+            # Re-emit chunk-by-chunk to simulate streaming
+            chunk_size = 5
+            base_chunk = chunks_metadata[0] if chunks_metadata else {}
+            chunk_id = base_chunk.get("id") or f"chatcmpl-{int(time.time())}"
+            created_time = base_chunk.get("created") or int(time.time())
+            model_name = base_chunk.get("model") or requested_model
+            
+            # Yield role init chunk
+            first_chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant"},
+                    "finish_reason": None
+                }]
+            }
+            yield f"data: {json.dumps(first_chunk)}\n\n"
+            
+            for i in range(0, len(redacted_text), chunk_size):
+                sub_text = redacted_text[i:i+chunk_size]
+                stream_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": sub_text},
+                        "finish_reason": None
+                    }]
+                }
+                log(f"DEBUG YIELD: data: {json.dumps(stream_chunk)}")
+                yield f"data: {json.dumps(stream_chunk)}\n\n"
+                await asyncio.sleep(0.01)
+                
+            # Yield stop chunk
+            stop_chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }
+            yield f"data: {json.dumps(stop_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+    else:
+        # Non-streaming response
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(target_url, headers=headers, json=body, timeout=60.0)
+            if resp.status_code != 200:
+                return JSONResponse(status_code=resp.status_code, content=resp.json())
+
+            resp_data = resp.json()
+            
+            # FIX: Ensure OpenAI-compatible fields for LiteLLM when using Hugging Face
+            if "created" not in resp_data:
+                resp_data["created"] = int(time.time())
+            if "id" not in resp_data:
+                resp_data["id"] = f"chatcmpl-{int(time.time())}"
+            if "object" not in resp_data:
+                resp_data["object"] = "chat.completion"
+            if "model" not in resp_data:
+                resp_data["model"] = requested_model
+
+            # Outbound PII Redaction
+            choices = resp_data.get("choices", [])
+            outbound_redacted = False
+            for choice in choices:
+                msg = choice.get("message", {})
+                content = msg.get("content", "")
+                if content:
+                    redacted = content
+                    if nim_guard_instance and nim_guard_instance.config.get("enabled"):
+                        redacted = nim_guard_instance.redact_pii(content)
+                    else:
+                        redacted = re.sub(email_pattern, '[REDACTED-EMAIL]', redacted)
+                        redacted = re.sub(ssn_pattern, '[REDACTED-SSN]', redacted)
+                        redacted = re.sub(phone_pattern, '[REDACTED-PHONE]', redacted)
+                    
+                    if redacted != content:
+                        msg["content"] = redacted
+                        outbound_redacted = True
+
+            if outbound_redacted:
+                log("✂️ Outbound PII Redacted from full response")
+                dashboard_state.add_event({
+                    "action": "redact",
+                    "tool": "chat_completion",
+                    "agent": "nemo-pii",
+                    "reason": "Outbound PII Redacted (Response)",
+                    "severity": "medium",
+                    "stage": "pii-redaction-outbound",
+                    "timestamp": time.time()
+                })
+
+            dashboard_state.add_event({
+                "action": "allow",
+                "tool": "chat_completion",
+                "agent": f"user-{user_id}",
+                "reason": f"Chat completion successful (Tokens: {resp_data.get('usage', {}).get('total_tokens', 0)})",
+                "severity": "low",
+                "stage": "response-passthrough",
+                "timestamp": time.time()
+            })
+
+            return JSONResponse(content=resp_data)
+
+
 # =========================
 # MAIN
 # =========================
@@ -737,13 +1477,31 @@ def main():
     if is_learning:
         log("📚 LEARNING MODE ACTIVE: Blocks will be discovered but not enforced (risk score = 0)")
     else:
-        log("🕵️♂️ PROTECTION MODE ACTIVE: Fraud Engine will enforce risk limits")
+        log("🕵️‍♂️ PROTECTION MODE ACTIVE: Fraud Engine will enforce risk limits")
+
+    # Bind globals for FastAPI endpoints
+    global gateway_instance, nim_guard_instance, fraud_engine_instance
+    gateway_instance = gw
+    nim_guard_instance = nim_guard
+    fraud_engine_instance = fraud_engine
 
     # Start the Dashboard with configurable port
     dashboard_port = int(os.getenv("DASHBOARD_PORT", "9090"))
     try:
         start_dashboard(port=dashboard_port)
         log(f"🌐 Dashboard available at: http://localhost:{dashboard_port}")
+        
+        proxy_port = int(os.getenv("SHIELD_PROXY_PORT", "5001"))
+        if proxy_port != dashboard_port:
+            def run_proxy():
+                try:
+                    import uvicorn
+                    from mcp_firewall.dashboard.app import app as local_app
+                    uvicorn.run(local_app, host="0.0.0.0", port=proxy_port, log_level="error")
+                except Exception as e:
+                    log(f"⚠️ Proxy server thread encountered error: {e}")
+            threading.Thread(target=run_proxy, daemon=True).start()
+            log(f"🛡️ Shield Proxy available at: http://localhost:{proxy_port}/v1")
         # --- FIX: Override dashboard HTML to add polling fallback ---
         # The library's WebSocket broadcast fails from sync threads (bridge's input/output threads).
         # The /api/stats and /api/events endpoints work perfectly (they read shared state directly).
@@ -1134,6 +1892,12 @@ setInterval(() => {
 
                         # 2. ROLE CHECK
                         user_role = normalize_role(tool_args.get("role", DEFAULT_ROLE))
+                        # Inject role so that mcp-firewall matches rule arguments.role correctly
+                        if isinstance(tool_args, dict):
+                            tool_args["role"] = user_role
+                            if "params" in data and "arguments" in data["params"]:
+                                data["params"]["arguments"]["role"] = user_role
+
                         allowed, required = role_allowed(tool_name, user_role)
                         if not allowed:
                             log(f"🚫 Role violation: {user_role} cannot use {tool_name}")

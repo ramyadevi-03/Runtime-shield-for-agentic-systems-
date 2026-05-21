@@ -15,5 +15,5 @@ def search_files(directory, pattern):
                 pass
 
 if __name__ == "__main__":
-    # Fixed path for the active workspace
-    search_files(r"c:\Users\Lenovo\Desktop\Runtime-shield- login\Runtime-shield-for-agentic-systems", "EVENTS CALLED")
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    search_files(current_dir, "EVENTS CALLED")

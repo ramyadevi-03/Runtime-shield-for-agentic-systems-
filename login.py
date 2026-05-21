@@ -16,7 +16,7 @@ if sys.platform == 'win32':
 # Load environment
 DOTENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 # 🏠 Synchronize with the main project folder
-MAIN_DOTENV_PATH = r"c:\Users\Lenovo\Desktop\Runtime-shield- login\Runtime-shield-for-agentic-systems\.env"
+MAIN_DOTENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 load_dotenv(DOTENV_PATH, override=True)
 
