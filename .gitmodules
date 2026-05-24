@@ -1,0 +1,3 @@
+[submodule "damn-vulnerable-llm-agent"]
+	path = damn-vulnerable-llm-agent
+	url = https://github.com/ReversecLabs/damn-vulnerable-llm-agent.git

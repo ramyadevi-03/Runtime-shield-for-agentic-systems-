@@ -4,3 +4,4 @@ venv/
 *.log
 dist/
 keycloak_data/
+telemetry.db*

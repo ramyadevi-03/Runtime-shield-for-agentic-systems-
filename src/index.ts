@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerTools } from "./tools/tools.js";
+import { verifySpiffeIdentity } from "./tools/spiffeAuth.js";
 import dotenv from "dotenv";
 
 import path from "node:path";
@@ -31,6 +32,9 @@ registerTools(server);
 
 // Connect via Stdio
 async function main() {
+    console.error("🔐 Initializing SPIFFE Workload Attestation...");
+    await verifySpiffeIdentity().catch(err => console.error("⚠️ SPIFFE Error:", err));
+
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error("Keycloak MCP Server running on stdio");

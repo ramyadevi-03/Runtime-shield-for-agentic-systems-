@@ -12,7 +12,7 @@ export async function verifySpiffeIdentity(): Promise<{
     spiffe_id?: string;
     error?: string;
 }> {
-    const socketPath = process.env.SPIRE_AGENT_SOCKET || "C:\\ProgramData\\spire\\agent\\public\\api.sock";
+    const socketPath = process.env.SPIRE_AGENT_SOCKET || (process.platform === "win32" ? "C:\\ProgramData\\spire\\agent\\public\\api.sock" : "/tmp/spire-agent/public/api.sock");
     const bundlePath = process.env.SPIFFE_BUNDLE_PATH || "";
 
     // Check if SPIRE agent is available
@@ -22,7 +22,7 @@ export async function verifySpiffeIdentity(): Promise<{
             const output = execSync('spire-agent api fetch x509', { encoding: 'utf8' });
             if (output.includes("SPIFFE ID:")) {
                 const spiffeId = output.match(/SPIFFE ID:\s+([^\s]+)/)?.[1];
-                console.log(`✅ SPIFFE identity verified via CLI: ${spiffeId}`);
+                console.error(`✅ SPIFFE identity verified via CLI: ${spiffeId}`);
                 return { valid: true, spiffe_id: spiffeId };
             }
         } catch (e) {
@@ -66,7 +66,7 @@ export async function verifySpiffeIdentity(): Promise<{
             }
         }
 
-        console.log(`✅ SPIFFE identity verified: ${spiffeId}`);
+        console.error(`✅ SPIFFE identity verified: ${spiffeId}`);
         return { valid: true, spiffe_id: spiffeId };
 
     } catch (err: any) {
@@ -110,6 +110,6 @@ async function validateSVIDAgainstBundle(svidData: Buffer, bundlePath: string): 
 }
 
 export default function verifySpiffeIdentitySync(): boolean {
-    const socketPath = process.env.SPIRE_AGENT_SOCKET || "C:\\ProgramData\\spire\\agent\\public\\api.sock";
+    const socketPath = process.env.SPIRE_AGENT_SOCKET || (process.platform === "win32" ? "C:\\ProgramData\\spire\\agent\\public\\api.sock" : "/tmp/spire-agent/public/api.sock");
     return fs.existsSync(socketPath);
 }
