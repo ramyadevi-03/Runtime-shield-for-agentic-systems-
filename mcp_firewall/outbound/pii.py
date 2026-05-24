@@ -14,7 +14,7 @@ from ...models import (
     ToolCallResponse,
 )
 
-# PII patterns: (name, regex)
+# PII patterns: (name, regex) — used only when config.pii.outbound_patterns is empty
 PII_PATTERNS: list[tuple[str, str]] = [
     ("Email Address", r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
     ("Phone (International)", r"\+\d{1,3}[\s.-]?\(?\d{1,4}\)?[\s.-]?\d{2,4}[\s.-]?\d{2,4}[\s.-]?\d{0,4}"),
@@ -24,8 +24,6 @@ PII_PATTERNS: list[tuple[str, str]] = [
     ("AHV (Swiss SSN)", r"\b756\.\d{4}\.\d{4}\.\d{2}\b"),
     ("IPv4 Address", r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"),
 ]
-
-REDACT_PLACEHOLDER = "[PII REDACTED by mcp-firewall]"
 
 
 class PIIDetector(OutboundStage):
@@ -47,6 +45,7 @@ class PIIDetector(OutboundStage):
             if not text:
                 continue
 
+            default_placeholder = config.pii.placeholder
             for name, pattern in PII_PATTERNS:
                 matches = list(re.finditer(pattern, text))
                 if matches:
@@ -54,7 +53,7 @@ class PIIDetector(OutboundStage):
 
                     if config.pii.action == Action.REDACT:
                         for match in reversed(matches):
-                            text = text[: match.start()] + REDACT_PLACEHOLDER + text[match.end() :]
+                            text = text[: match.start()] + default_placeholder + text[match.end() :]
                             modified = True
 
             if modified:
@@ -68,7 +67,7 @@ class PIIDetector(OutboundStage):
             stage=self.stage,
             action=config.pii.action,
             reason=f"PII detected: {', '.join(unique)}",
-            severity=Severity.MEDIUM,
+            severity=config.pii.severity,  # configurable via pii.severity in YAML
             details={"pii_types": unique},
         )
         return response, decision

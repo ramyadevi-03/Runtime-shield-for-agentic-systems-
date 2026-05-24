@@ -1,6 +1,15 @@
 import json
 import logging
 import time
+import sys
+
+# Ensure terminal standard streams handle UTF-8/emojis correctly on Windows
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 class ShieldStub:
     """

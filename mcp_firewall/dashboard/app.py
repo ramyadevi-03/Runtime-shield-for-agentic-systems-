@@ -37,6 +37,12 @@ class DashboardManager:
             self.active_connections.remove(websocket)
 
     async def broadcast_event(self, event: Dict[str, Any]):
+        # Enrich the event payload with engine and identity so the frontend displays them correctly
+        if "engine" not in event:
+            event["engine"] = event.get("agent", "unknown")
+        if "identity" not in event:
+            event["identity"] = event.get("agent", "unknown")
+
         stats = telemetry.get_metrics()
         payload = {"type": "event", "data": event, "current_stats": stats}
         for connection in self.active_connections:
@@ -60,7 +66,7 @@ class DashboardState:
                 action=event.get("action", "allow"),
                 tool=event.get("tool"),
                 reason=event.get("reason"),
-                identity=event.get("agent"),
+                identity=event.get("identity") or event.get("agent"),
                 details=event
             )
         except Exception as e:
@@ -263,6 +269,13 @@ DASHBOARD_HTML = """
                     <div>
                         <div style="font-weight: 600; font-size: 0.9rem; margin-bottom: 5px;">Bridge Proxy (Windows Host)</div>
                         <div class="spiffe-id">spiffe://runtime-shield/bridge</div>
+                    </div>
+                    <div class="tag" style="color: var(--green)">Verified</div>
+                </div>
+                <div class="mesh-item">
+                    <div>
+                        <div style="font-weight: 600; font-size: 0.9rem; margin-bottom: 5px;">Damn Vulnerable LLM Agent (Streamlit)</div>
+                        <div class="spiffe-id">spiffe://runtime-shield/llm-agent</div>
                     </div>
                     <div class="tag" style="color: var(--green)">Verified</div>
                 </div>

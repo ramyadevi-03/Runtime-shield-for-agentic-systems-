@@ -197,7 +197,7 @@ class NIMCloudGuard:
             "Content-Type": "application/json"
         }
 
-    def check_jailbreak(self, text: str) -> tuple[bool, str]:
+    def check_jailbreak(self, text: str, is_admin: bool = False) -> tuple[bool, str]:
         if not self.config or not self.config.get("jailbreak_rail", {}).get("enabled"):
             return False, ""
         
@@ -205,19 +205,46 @@ class NIMCloudGuard:
         # Returns "safe" or "unsafe\nS1,S2..." with category codes
         endpoint = f"{self.base_url}/chat/completions"
         try:
+            log(f"[DEBUG LLAMA GUARD] Sending to {endpoint}")
+            log(f"[DEBUG LLAMA GUARD] Payload Text: {repr(text)}")
+            log(f"[DEBUG LLAMA GUARD] API Key: {self.api_key[:10]}...")
             data = {
                 "model": "meta/llama-guard-4-12b",
                 "messages": [{"role": "user", "content": text}],
                 "max_tokens": 50
             }
             response = requests.post(endpoint, headers=self.headers, json=data, timeout=5)
+            log(f"[DEBUG LLAMA GUARD] Status Code: {response.status_code}")
+            log(f"[DEBUG LLAMA GUARD] Response: {response.text}")
             if response.status_code == 200:
                 verdict = response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip().lower()
                 if verdict.startswith("unsafe"):
                     # Extract category codes for detailed logging
                     categories = re.findall(r'S\d+', verdict, re.IGNORECASE)
-                    cat_str = ", ".join(categories) if categories else "unspecified"
-                    return True, f"Llama Guard 4 UNSAFE — Violated categories: {cat_str}"
+                    
+                    # Categories to suppress:
+                    # S7  = Privacy (PII in context) — suppressed for admins + redacted text
+                    # S14 = Code Interpreter Abuse — suppressed for admins because raw financial
+                    #        data (emails, credit cards) in tool responses triggers false positives
+                    ADMIN_BYPASS_CATEGORIES = {"S7", "S14"}
+                    REDACTION_BYPASS_CATEGORIES = {"S7"}
+                    
+                    has_redacted_tokens = any(token in text for token in ["[REDACTED-EMAIL]", "[REDACTED-SSN]", "[REDACTED-PHONE]", "[REDACTED-CC]"])
+                    
+                    if is_admin:
+                        active_violations = [c for c in categories if c.upper() not in ADMIN_BYPASS_CATEGORIES]
+                        if not active_violations:
+                            log(f"ℹ️ Llama Guard: {', '.join(categories)} safety violation(s) ignored because authenticated user has Administrator privileges.")
+                    elif has_redacted_tokens:
+                        active_violations = [c for c in categories if c.upper() not in REDACTION_BYPASS_CATEGORIES]
+                        if not active_violations:
+                            log("ℹ️ Llama Guard: S7 (Privacy) safety violation ignored because dedicated Microsoft Presidio PII redaction is active.")
+                    else:
+                        active_violations = categories
+                        
+                    if active_violations:
+                        cat_str = ", ".join(active_violations)
+                        return True, f"Llama Guard 4 UNSAFE — Violated categories: {cat_str}"
             elif response.status_code == 401:
                 log(f"⚠️ Llama Guard auth failed (401). Check NVIDIA_API_KEY.")
         except Exception as e:
@@ -243,28 +270,468 @@ class NIMCloudGuard:
         
         return False, ""
 
-    def redact_pii(self, text: str) -> str:
-        """Regex-based PII redaction (Llama Guard is a classifier, not a text rewriter)."""
+    def redact_pii(self, text: str, role: str = "user") -> str:
+        """Presidio-based NLP PII redaction (Option A)."""
+        if role == "admin":
+            return text
         rail_cfg = self.config.get("pii_rail", {}) if self.config else {}
         if not rail_cfg or not rail_cfg.get("enabled"):
             return text
         
-        import re as re_mod
-        original = text
-        
-        # Email addresses
-        text = re_mod.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '[REDACTED-EMAIL]', text)
-        # SSN patterns (xxx-xx-xxxx)
-        text = re_mod.sub(r'\b\d{3}-\d{2}-\d{4}\b', '[REDACTED-SSN]', text)
-        # Phone numbers (various formats)
-        text = re_mod.sub(r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b', '[REDACTED-PHONE]', text)
-        # Credit card numbers (4 groups of 4 digits)
-        text = re_mod.sub(r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b', '[REDACTED-CC]', text)
-        
-        if text != original:
-            log("✂️ PII redacted via regex patterns (Email/SSN/Phone/CC)")
-        
+        return redact_pii_with_presidio(text)
+
+# ==========================================
+# MICROSOFT PRESIDIO NLP PII REDACTION (OPTION A) & AI SEMANTIC REDACTION (OPTION B)
+# ==========================================
+
+_presidio_analyzer = None
+_presidio_anonymizer = None
+_ai_redactor = None
+
+def get_ai_redactor_instance():
+    global _ai_redactor
+    if _ai_redactor is None:
+        from mcp_firewall.privacy.redaction_engine import RedactionEngine
+        global gateway_instance
+        pii_cfg = gateway_instance.config.pii if (gateway_instance and gateway_instance.config) else None
+        _ai_redactor = RedactionEngine(pii_config=pii_cfg)
+    return _ai_redactor
+
+def get_presidio_instances():
+    global _presidio_analyzer, _presidio_anonymizer
+    if _presidio_analyzer is None or _presidio_anonymizer is None:
+        from presidio_analyzer import AnalyzerEngine
+        from presidio_anonymizer import AnonymizerEngine
+        _presidio_analyzer = AnalyzerEngine()
+        _presidio_anonymizer = AnonymizerEngine()
+    return _presidio_analyzer, _presidio_anonymizer
+
+def is_markdown_table(text: str) -> bool:
+    """
+    Returns True if the text represents a formatted Markdown table.
+    """
+    if not isinstance(text, str) or "|" not in text:
+        return False
+    lines = [l.strip() for l in text.strip().split('\n') if l.strip()]
+    if len(lines) < 2:
+        return False
+    return lines[0].startswith('|') and lines[0].endswith('|') and lines[1].startswith('|') and '-' in lines[1]
+
+
+def is_csv_text(text: str) -> bool:
+    """
+    Returns True if the text looks like raw CSV data (multi-line, comma-delimited).
+    Skips Markdown tables (already pipe-formatted) and single-line strings.
+    """
+    if not isinstance(text, str) or ',' not in text:
+        return False
+    # Ignore text that is already a Markdown table
+    if '|' in text and '-+-' in text.replace(' ', ''):
+        return False
+    lines = [l for l in text.strip().split('\n') if l.strip()]
+    if len(lines) < 2:
+        return False
+    # At least half the lines should contain commas
+    comma_lines = sum(1 for l in lines if ',' in l)
+    return comma_lines >= max(1, len(lines) // 2)
+
+
+def csv_to_markdown_table(csv_text: str) -> str:
+    """
+    Converts a raw CSV string into a Markdown pipe table.
+    Completely dynamic — reads headers from the first row, no hardcoding.
+    """
+    import csv as _csv
+    import io
+    try:
+        reader = list(_csv.reader(io.StringIO(csv_text.strip())))
+        if len(reader) < 2:
+            return csv_text  # Not enough rows; return as-is
+        headers = reader[0]
+        separator = '| ' + ' | '.join(['---'] * len(headers)) + ' |'
+        rows = ['| ' + ' | '.join(str(c).strip() for c in row) + ' |' for row in reader]
+        header_row = rows[0]
+        data_rows = rows[1:]
+        return '\n'.join([header_row, separator] + data_rows)
+    except Exception:
+        return csv_text
+
+
+def is_tsv_text(text: str) -> bool:
+    """
+    Returns True if the text looks like raw TSV data (multi-line, tab-delimited).
+    Skips Markdown tables and single-line strings.
+    """
+    if not isinstance(text, str) or '\t' not in text:
+        return False
+    if '|' in text and '-+-' in text.replace(' ', ''):
+        return False
+    lines = [l for l in text.strip().split('\n') if l.strip()]
+    if len(lines) < 2:
+        return False
+    # At least half the lines should contain tabs
+    tab_lines = sum(1 for l in lines if '\t' in l)
+    return tab_lines >= max(1, len(lines) // 2)
+
+
+def tsv_to_markdown_table(tsv_text: str) -> str:
+    """
+    Converts raw TSV text to a Markdown pipe table.
+    Completely dynamic — reads headers from the first row, no hardcoding.
+    """
+    import csv as _csv
+    import io
+    try:
+        reader = list(_csv.reader(io.StringIO(tsv_text.strip()), delimiter='\t'))
+        if len(reader) < 2:
+            return tsv_text
+        headers = reader[0]
+        separator = '| ' + ' | '.join(['---'] * len(headers)) + ' |'
+        rows = ['| ' + ' | '.join(str(c).strip() for c in row) + ' |' for row in reader]
+        header_row = rows[0]
+        data_rows = rows[1:]
+        return '\n'.join([header_row, separator] + data_rows)
+    except Exception:
+        return tsv_text
+
+
+def format_embedded_json_arrays(text: str) -> str:
+    """
+    Scans the text for JSON arrays of dictionaries (either raw or inside codeblocks)
+    and converts them to Markdown tables dynamically.
+    """
+    if not isinstance(text, str):
         return text
+
+    def _list_to_md(data: list) -> str:
+        headers = []
+        for item in data:
+            if isinstance(item, dict):
+                for k in item.keys():
+                    if k not in headers:
+                        headers.append(k)
+        if not headers:
+            return ""
+        separator = '| ' + ' | '.join(['---'] * len(headers)) + ' |'
+        header_row = '| ' + ' | '.join(str(h) for h in headers) + ' |'
+        rows = []
+        for item in data:
+            if isinstance(item, dict):
+                row_vals = [str(item.get(h, '')).replace('\n', ' ').strip() for h in headers]
+                rows.append('| ' + ' | '.join(row_vals) + ' |')
+        return '\n'.join([header_row, separator] + rows)
+
+    # 1. Look for ```json ... ``` codeblocks containing arrays
+    pattern_codeblock = r"```json\s*(\[\s*\{.*?\n?\s*\}\s*\])\s*```"
+    def repl_codeblock(match):
+        try:
+            import json as _json
+            content = match.group(1).strip()
+            data = _json.loads(content)
+            if isinstance(data, list) and len(data) > 0 and all(isinstance(x, dict) for x in data):
+                return _list_to_md(data)
+        except Exception:
+            pass
+        return match.group(0)
+
+    text = re.sub(pattern_codeblock, repl_codeblock, text, flags=re.DOTALL)
+
+    # 2. Look for raw JSON arrays of dicts in the text
+    pattern_raw = r"(\[\s*\{\s*\"[^\"]+\"\s*:.*?\s*\}\s*\])"
+    def repl_raw(match):
+        try:
+            import json as _json
+            content = match.group(1).strip()
+            data = _json.loads(content)
+            if isinstance(data, list) and len(data) > 0 and all(isinstance(x, dict) for x in data):
+                return _list_to_md(data)
+        except Exception:
+            pass
+        return match.group(0)
+
+    text = re.sub(pattern_raw, repl_raw, text, flags=re.DOTALL)
+    return text
+
+
+def format_embedded_tabular_segments(text: str) -> str:
+    """
+    Scans the text for embedded raw CSV or TSV blocks (consecutive comma or tab delimited lines)
+    and replaces each with a Markdown pipe table. Also parses and formats JSON arrays of objects.
+    """
+    if not isinstance(text, str):
+        return text
+
+    # First, handle JSON arrays
+    text = format_embedded_json_arrays(text)
+
+    # Now, process line-by-line for CSV/TSV
+    lines = text.split('\n')
+    result = []
+    
+    tab_buffer = []
+    current_type = None  # 'csv' or 'tsv'
+
+    def flush_buffer():
+        if tab_buffer:
+            block = '\n'.join(tab_buffer)
+            if current_type == 'csv' and is_csv_text(block):
+                result.append(csv_to_markdown_table(block))
+            elif current_type == 'tsv' and is_tsv_text(block):
+                result.append(tsv_to_markdown_table(block))
+            else:
+                result.extend(tab_buffer)
+            tab_buffer.clear()
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('|'):
+            flush_buffer()
+            result.append(line)
+            current_type = None
+            continue
+
+        is_csv_line = ',' in stripped
+        is_tsv_line = '\t' in stripped
+        line_type = 'tsv' if is_tsv_line else ('csv' if is_csv_line else None)
+
+        if line_type:
+            if current_type is None:
+                current_type = line_type
+                tab_buffer.append(line)
+            elif current_type == line_type:
+                tab_buffer.append(line)
+            else:
+                flush_buffer()
+                current_type = line_type
+                tab_buffer.append(line)
+        else:
+            flush_buffer()
+            result.append(line)
+            current_type = None
+
+    flush_buffer()
+    return '\n'.join(result)
+
+
+def format_embedded_csv_segments(text: str) -> str:
+    """
+    Scans the text for embedded tabular data (CSV, TSV, or JSON arrays)
+    and replaces them with Markdown pipe tables dynamically.
+    """
+    return format_embedded_tabular_segments(text)
+
+
+
+def extract_outer_json_block(text: str) -> tuple:
+    """
+    Given a raw text response, robustly extracts the outermost JSON block (finding the first '{' and last '}').
+    Also returns whether it is wrapped in triple backticks and the span indices (start, end) of the JSON block.
+    """
+    if not isinstance(text, str):
+        return "", False, -1, -1
+    start_idx = text.find('{')
+    end_idx = text.rfind('}')
+    if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+        return "", False, -1, -1
+
+    json_str = text[start_idx:end_idx+1]
+    
+    # Check if there is a ```json wrapper around this block
+    is_wrapped = False
+    prefix = text[:start_idx].strip()
+    suffix = text[end_idx+1:].strip()
+    if prefix.endswith("```json") and suffix.startswith("```"):
+        is_wrapped = True
+        
+    return json_str, is_wrapped, start_idx, end_idx
+
+
+def redact_pii_with_presidio(text: str, is_raw: bool = False, skip_headers: bool = True) -> str:
+    original = text
+
+    # --- JSON INTERCEPT RULE ---
+    if not is_raw:
+        try:
+            json_str, is_wrapped, start_idx, end_idx = extract_outer_json_block(text)
+            if json_str:
+                data = json.loads(json_str)
+                if isinstance(data, dict) and data.get("action") == "Final Answer":
+                    action_input = data.get("action_input")
+                    if isinstance(action_input, str) and action_input.strip():
+                        # Step 1: Convert any embedded CSV/TSV/JSON blocks to Markdown tables FIRST,
+                        # so that column headers are present as table headers before Presidio runs.
+                        formatted_input = format_embedded_csv_segments(action_input)
+
+                        # Step 2: Redact PII on the formatted text.
+                        # The Markdown header-skipping rule will now protect column header rows.
+                        redacted_input = redact_pii_with_presidio(formatted_input, is_raw=True, skip_headers=True)
+
+                        data["action_input"] = redacted_input
+                        new_json_str = json.dumps(data, indent=2)
+                        
+                        if is_wrapped:
+                            wrap_start = text[:start_idx].rfind("```json")
+                            wrap_end = text[end_idx+1:].find("```")
+                            if wrap_start != -1 and wrap_end != -1:
+                                wrap_end = end_idx + 1 + wrap_end + 3
+                                return text[:wrap_start] + f"```json\n{new_json_str}\n```" + text[wrap_end:]
+                        return text[:start_idx] + new_json_str + text[end_idx+1:]
+        except Exception as e:
+            log(f"⚠️ JSON intercept in redaction failed: {e}")
+
+
+    # --- TABLE HEADER SKIPPING RULES (Option A / B Outbound Protection) ---
+    # To prevent false redaction of table headers (like Name, Email, CreditCard, Status)
+    # when processing CSV/tabular data, we keep headers completely verbatim.
+    if skip_headers and isinstance(text, str) and text.strip():
+        if is_csv_text(text):
+            try:
+                lines = text.split('\n')
+                if len(lines) >= 2:
+                    header = lines[0]
+                    rows = '\n'.join(lines[1:])
+                    redacted_rows = redact_pii_with_presidio(rows, is_raw=True, skip_headers=False)
+                    return header + '\n' + redacted_rows
+            except Exception:
+                pass
+
+        if is_markdown_table(text):
+            try:
+                lines = text.split('\n')
+                if len(lines) >= 3:
+                    header = lines[0]
+                    separator = lines[1]
+                    rows = '\n'.join(lines[2:])
+                    redacted_rows = redact_pii_with_presidio(rows, is_raw=True, skip_headers=False)
+                    return header + '\n' + separator + '\n' + redacted_rows
+            except Exception:
+                pass
+
+    # Load dynamic config if gateway is initialized
+    global gateway_instance
+
+    # 1. OPTION B: AI-Native Semantic Redaction (if NIM key is active)
+    import os
+    if os.getenv("NVIDIA_NIM_API_KEY"):
+        pii_enabled = True
+        if gateway_instance and gateway_instance.config and gateway_instance.config.pii:
+            pii_enabled = gateway_instance.config.pii.enabled
+        
+        if pii_enabled:
+            try:
+                redactor = get_ai_redactor_instance()
+                redacted, findings = redactor.redact(text)
+                if redacted != original:
+                    log(f"✂️ PII redacted via NVIDIA NIM AI-Native DLP")
+                    return redacted
+                return text
+            except Exception as e:
+                log(f"⚠️ AI Redaction error: {e}. Falling back to standard filters.")
+
+    # None = auto-detect ALL Presidio-supported entity types (no hardcoding)
+    entities = None
+    exclude_entities = []
+    raw_operators = {}
+    default_placeholder = "[PII REDACTED]"
+    regex_fallbacks = [
+        {"name": "Credit Card", "pattern": r'\b\d{4}-\d{4}-\d{4}-\d{4}\b', "placeholder": '[REDACTED-CC]'},
+        {"name": "Phone", "pattern": r'\b\d{3}-\d{4}\b', "placeholder": '[REDACTED-PHONE]'}
+    ]
+
+    if gateway_instance and gateway_instance.config and gateway_instance.config.pii:
+        pii_cfg = gateway_instance.config.pii
+        cfg_entities = getattr(pii_cfg, "presidio_entities", [])
+        # Empty list or ["ALL"] → pass None to Presidio (detect everything)
+        if cfg_entities and cfg_entities != ["ALL"]:
+            entities = cfg_entities
+        exclude_entities = getattr(pii_cfg, "presidio_exclude_entities", []) or []
+        if getattr(pii_cfg, "presidio_operators", {}):
+            raw_operators = pii_cfg.presidio_operators
+        default_placeholder = getattr(pii_cfg, "placeholder", default_placeholder)
+        if getattr(pii_cfg, "regex_fallbacks", []):
+            regex_fallbacks = pii_cfg.regex_fallbacks
+
+    try:
+        analyzer, anonymizer = get_presidio_instances()
+        from presidio_anonymizer.entities import OperatorConfig
+
+        results = analyzer.analyze(text=text, language="en", entities=entities)
+        
+        # Apply exclude list
+        if exclude_entities:
+            results = [r for r in results if r.entity_type not in exclude_entities]
+
+        # Build per-entity operators from config; fall back to default placeholder for any unknown entity
+        operators = {
+            ent: OperatorConfig("replace", {"new_value": placeholder})
+            for ent, placeholder in raw_operators.items()
+        }
+        default_op = OperatorConfig("replace", {"new_value": default_placeholder})
+        for result in results:
+            if result.entity_type not in operators:
+                operators[result.entity_type] = default_op
+
+        anonymized = anonymizer.anonymize(text=text, analyzer_results=results, operators=operators)
+        text = anonymized.text
+
+        if text != original:
+            detected = list({r.entity_type for r in results})
+            log(f"✂️ PII redacted via Microsoft Presidio NLP — types: {detected}")
+    except Exception as e:
+        log(f"⚠️ Presidio PII redaction error: {e}. Returning original.")
+
+    # --- DYNAMIC REGEX FALLBACKS ---
+    for fallback in regex_fallbacks:
+        name = fallback.get("name", "Fallback")
+        pattern = fallback.get("pattern", "")
+        placeholder = fallback.get("placeholder", "[REDACTED]")
+        if not pattern:
+            continue
+        try:
+            if re.search(pattern, text):
+                text = re.sub(pattern, placeholder, text)
+                if text != original:
+                    log(f"✂️ PII redacted via regex fallback ({name})")
+        except Exception:
+            pass
+
+    return text
+
+
+def has_pii_presidio(text: str) -> bool:
+    global gateway_instance
+    # None = auto-detect ALL entity types; overridden only by explicit YAML list
+    entities = None
+    exclude_entities = []
+    if gateway_instance and gateway_instance.config and gateway_instance.config.pii:
+        pii_cfg = gateway_instance.config.pii
+        cfg_entities = getattr(pii_cfg, "presidio_entities", [])
+        if cfg_entities and cfg_entities != ["ALL"]:
+            entities = cfg_entities
+        exclude_entities = getattr(pii_cfg, "presidio_exclude_entities", []) or []
+
+    try:
+        analyzer, _ = get_presidio_instances()
+        results = analyzer.analyze(text=text, language="en", entities=entities)
+        if exclude_entities:
+            results = [r for r in results if r.entity_type not in exclude_entities]
+        return len(results) > 0
+    except Exception as e:
+        log(f"⚠️ Presidio PII detection error: {e}")
+        return False
+
+# Warm up Microsoft Presidio NLP engine synchronously on startup
+def _warmup_presidio_sync():
+    try:
+        log("⏳ Warming up Microsoft Presidio NLP engine...")
+        get_presidio_instances()
+        log("✅ Microsoft Presidio NLP engine fully warmed up!")
+    except Exception as e:
+        log(f"⚠️ Presidio warmup warning: {e}")
+
+
+
+
 
 
 
@@ -293,6 +760,144 @@ def log(msg: str):
     except UnicodeEncodeError:
         # Fallback for terminals that don't support UTF-8
         print(msg.encode('ascii', 'replace').decode('ascii'), file=sys.stderr, flush=True)
+
+
+def sanitize_llm_json(text: str) -> str:
+    """
+    Sanitizes LLM outputs to prevent Pydantic validation errors in LangChain's AIMessage content.
+    If the LLM outputs a JSON structure containing `"action": "Final Answer"` where
+    `"action_input"` is an object or list (instead of a string), we serialize it to a string.
+    Also maps "action": "Error" to "action": "Final Answer" to prevent invalid tool loops.
+    """
+    try:
+        json_str, is_wrapped, start_idx, end_idx = extract_outer_json_block(text)
+        if json_str:
+            data = json.loads(json_str)
+            if isinstance(data, dict):
+                # 1. Normalize action="Error" / "error" to "Final Answer"
+                if str(data.get("action")).lower() in ["error", "invalid_action", "invalid_tool"]:
+                    data["action"] = "Final Answer"
+                    action_input = data.get("action_input") or data.get("error") or "An error occurred processing your request."
+                    data["action_input"] = str(action_input)
+                
+                # 2. Serialize dict/list action_input to string to prevent parsing errors
+                if data.get("action") == "Final Answer":
+                    action_input = data.get("action_input")
+                    if action_input is not None and not isinstance(action_input, str):
+                        if isinstance(action_input, (dict, list)):
+                            data["action_input"] = json.dumps(action_input)
+                        else:
+                            data["action_input"] = str(action_input)
+                    
+                    # 3. Dynamic CSV to Markdown Table formatting
+                    action_input = data.get("action_input")
+                    if isinstance(action_input, str) and action_input.strip():
+                        data["action_input"] = format_embedded_csv_segments(action_input)
+
+                    new_json_str = json.dumps(data, indent=2)
+                    if is_wrapped:
+                        wrap_start = text[:start_idx].rfind("```json")
+                        wrap_end = text[end_idx+1:].find("```")
+                        if wrap_start != -1 and wrap_end != -1:
+                            wrap_end = end_idx + 1 + wrap_end + 3
+                            return text[:wrap_start] + f"```json\n{new_json_str}\n```" + text[wrap_end:]
+                    return text[:start_idx] + new_json_str + text[end_idx+1:]
+    except Exception:
+        pass
+        
+    return text
+
+
+def is_tool_call(content: str) -> bool:
+    """
+    Returns True if the content represents a structured ReAct tool call
+    (i.e. it contains a JSON block with an "action" key that is NOT "Final Answer").
+    """
+    try:
+        pattern = r"```json\s*(.*?)\s*```"
+        match = re.search(pattern, content, re.DOTALL)
+        json_str = ""
+        if match:
+            json_str = match.group(1).strip()
+        else:
+            trimmed = content.strip()
+            if trimmed.startswith("{") and trimmed.endswith("}"):
+                json_str = trimmed
+            else:
+                start_idx = content.find('{')
+                end_idx = content.rfind('}')
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    json_str = content[start_idx:end_idx+1]
+        
+        if json_str:
+            data = json.loads(json_str)
+            if isinstance(data, dict) and "action" in data:
+                action = data.get("action")
+                if action != "Final Answer":
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def is_csv_text(text: str) -> bool:
+    """
+    Returns True if the string looks like comma-separated rows.
+    """
+    if "," not in text:
+        return False
+    lines = [l.strip() for l in text.strip().split('\n') if l.strip()]
+    if len(lines) < 2:
+        return False
+    # Check if average number of commas is >= 2, and first line has >= 2 commas
+    avg_commas = sum(line.count(',') for line in lines) / len(lines)
+    return avg_commas >= 2 and lines[0].count(',') >= 2
+
+
+def csv_to_markdown(csv_str: str) -> str:
+    """
+    Converts a raw CSV string (with newlines and commas) into a clean Markdown table.
+    """
+    try:
+        import csv
+        from io import StringIO
+        f = StringIO(csv_str.strip())
+        reader = csv.reader(f)
+        rows = list(reader)
+        
+        if len(rows) < 2:
+            return csv_str
+            
+        headers = rows[0]
+        markdown_lines = []
+        
+        # Build headers row
+        markdown_lines.append("| " + " | ".join(headers) + " |")
+        # Build separator row
+        markdown_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        
+        # Build data rows
+        for row in rows[1:]:
+            # Pad row if columns don't match headers count
+            if len(row) < len(headers):
+                row += [""] * (len(headers) - len(row))
+            elif len(row) > len(headers):
+                row = row[:len(headers)]
+            markdown_lines.append("| " + " | ".join(row) + " |")
+            
+        return "\n".join(markdown_lines)
+    except Exception:
+        return csv_str
+
+
+def format_embedded_csv_segments(text: str) -> str:
+    """
+    Finds contiguous segments of CSV lines in a larger text block and
+    converts them into formatted Markdown tables.
+    """
+    return format_embedded_tabular_segments(text)
+
+
 
 
 # =========================
@@ -463,13 +1068,24 @@ ROLE_LEVELS = {
 }
 
 # Use RUNTIME_ROLE consistently everywhere
-DEFAULT_ROLE = os.getenv("RUNTIME_ROLE", "user").strip().lower()
+DEFAULT_ROLE = os.getenv("RUNTIME_ROLE", "user").strip().lower().replace("'", "").replace('"', '')
 
 
 def normalize_role(role: str) -> str:
+    global DEFAULT_ROLE
+    try:
+        load_dotenv(dotenv_path=DOTENV_PATH, override=True)
+    except Exception:
+        pass
+    raw_env_role = os.getenv("RUNTIME_ROLE", "user").strip().lower().replace("'", "").replace('"', '')
+    if raw_env_role in ROLE_LEVELS:
+        DEFAULT_ROLE = raw_env_role
+    else:
+        DEFAULT_ROLE = "user"
+        
     if not role:
         return DEFAULT_ROLE
-    role = str(role).strip().lower()
+    role = str(role).strip().lower().replace("'", "").replace('"', '')
     return role if role in ROLE_LEVELS else DEFAULT_ROLE
 
 
@@ -504,28 +1120,33 @@ def get_spiffe_config():
 
 def validate_spiffe_startup(spiffe_cfg):
     if not spiffe_cfg["enabled"]:
-        log("ℹ️ SPIFFE integration disabled. Running with current stdio bridge security.")
+        log("SPIFFE integration disabled. Running with current stdio bridge security.")
         return
 
-    log("🪪 SPIFFE integration enabled (startup validation mode).")
-    log(f"🪪 Bridge SPIFFE ID: {spiffe_cfg['bridge_id']}")
-    log(f"🪪 Expected MCP Server SPIFFE ID: {spiffe_cfg['server_id']}")
+    log("SPIFFE integration enabled (startup validation mode).")
+    log(f"Bridge SPIFFE ID: {spiffe_cfg['bridge_id']}")
+    log(f"Expected MCP Server SPIFFE ID: {spiffe_cfg['server_id']}")
 
     if spiffe_cfg["svid_path"]:
         if not os.path.exists(spiffe_cfg["svid_path"]):
             raise RuntimeError(f"SPIFFE SVID file not found: {spiffe_cfg['svid_path']}")
-        log(f"✅ SPIFFE SVID found at: {spiffe_cfg['svid_path']}")
+        log(f"SPIFFE SVID found at: {spiffe_cfg['svid_path']}")
     else:
-        log("⚠️ SPIFFE_SVID_PATH not configured. Continuing without local SVID file validation.")
+        log("SPIFFE_SVID_PATH not configured. Continuing without local SVID file validation.")
 
     if spiffe_cfg["bundle_path"]:
         if not os.path.exists(spiffe_cfg["bundle_path"]):
             raise RuntimeError(f"SPIFFE bundle file not found: {spiffe_cfg['bundle_path']}")
-        log(f"✅ SPIFFE trust bundle found at: {spiffe_cfg['bundle_path']}")
+        log(f"SPIFFE trust bundle found at: {spiffe_cfg['bundle_path']}")
     else:
-        log("⚠️ SPIFFE_BUNDLE_PATH not configured. Continuing without bundle file validation.")
+        log("SPIFFE_BUNDLE_PATH not configured. Continuing without bundle file validation.")
 
-    log("⚠️ Current transport is stdio, so this is not full mTLS SPIFFE authentication.")
+    # Run full cryptographic attestation at startup
+    attest_result = runtime_attest_svid(spiffe_cfg)
+    if attest_result["attested"]:
+        log(f"[SPIFFE] Runtime cryptographic attestation SUCCESS: {attest_result['spiffe_id']}")
+    else:
+        log(f"[SPIFFE] Runtime attestation note: {attest_result.get('reason', 'offline mode')}")
 
 
 def add_spiffe_dashboard_event(spiffe_cfg):
@@ -542,6 +1163,235 @@ def add_spiffe_dashboard_event(spiffe_cfg):
         "stage": "spiffe-startup",
         "timestamp": time.time()
     })
+
+
+# =========================
+# FEATURE 1: RUNTIME CRYPTOGRAPHIC ATTESTATION
+# Reads the local X.509 SVID from disk and verifies it against the CA bundle
+# at startup — proving this workload holds a valid, CA-signed identity.
+# =========================
+
+def runtime_attest_svid(spiffe_cfg: dict) -> dict:
+    """
+    Cryptographically attest the bridge's own SVID against the CA trust bundle.
+    Returns a dict with keys: attested (bool), spiffe_id (str), reason (str).
+    """
+    try:
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives import hashes as _hashes
+        from cryptography.hazmat.backends import default_backend
+
+        svid_path = spiffe_cfg.get("svid_path", "")
+        bundle_path = spiffe_cfg.get("bundle_path", "")
+
+        # Resolve default paths relative to spire/certs if not configured
+        _certs_dir = os.path.join(PROJECT_DIR, "spire", "certs")
+        if not svid_path or not os.path.exists(svid_path):
+            svid_path = os.path.join(_certs_dir, "bridge.crt")
+        if not bundle_path or not os.path.exists(bundle_path):
+            bundle_path = os.path.join(_certs_dir, "ca.crt")
+
+        if not os.path.exists(svid_path) or not os.path.exists(bundle_path):
+            return {"attested": False, "spiffe_id": spiffe_cfg.get("bridge_id", ""), "reason": "SVID or CA bundle not found on disk"}
+
+        # Load the SVID
+        with open(svid_path, "rb") as f:
+            svid_cert = _x509.load_pem_x509_certificate(f.read(), default_backend())
+
+        # Load the CA certificate (trust bundle)
+        with open(bundle_path, "rb") as f:
+            ca_cert = _x509.load_pem_x509_certificate(f.read(), default_backend())
+
+        # Verify the SVID was signed by the CA (cryptographic attestation)
+        from cryptography.hazmat.primitives.asymmetric import padding as _padding
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+
+        ca_public_key = ca_cert.public_key()
+        if isinstance(ca_public_key, _rsa.RSAPublicKey):
+            ca_public_key.verify(
+                svid_cert.signature,
+                svid_cert.tbs_certificate_bytes,
+                _padding.PKCS1v15(),
+                svid_cert.signature_hash_algorithm,
+            )
+        elif isinstance(ca_public_key, _ec.EllipticCurvePublicKey):
+            ca_public_key.verify(
+                svid_cert.signature,
+                svid_cert.tbs_certificate_bytes,
+                _ec.ECDSA(svid_cert.signature_hash_algorithm),
+            )
+        else:
+            ca_public_key.verify(
+                svid_cert.signature,
+                svid_cert.tbs_certificate_bytes,
+                svid_cert.signature_hash_algorithm,
+            )
+
+        # Extract SPIFFE URI from SubjectAlternativeName
+        spiffe_id_from_cert = ""
+        try:
+            san_ext = svid_cert.extensions.get_extension_for_class(_x509.SubjectAlternativeName)
+            uris = san_ext.value.get_values_for_type(_x509.UniformResourceIdentifier)
+            spiffe_uris = [u for u in uris if u.startswith("spiffe://")]
+            if spiffe_uris:
+                spiffe_id_from_cert = spiffe_uris[0]
+        except Exception:
+            spiffe_id_from_cert = spiffe_cfg.get("bridge_id", "")
+
+        # Verify the SPIFFE ID in the cert matches our configured bridge ID
+        expected_id = spiffe_cfg.get("bridge_id", "")
+        if expected_id and spiffe_id_from_cert and spiffe_id_from_cert != expected_id:
+            return {
+                "attested": False,
+                "spiffe_id": spiffe_id_from_cert,
+                "reason": f"SPIFFE ID mismatch: cert has '{spiffe_id_from_cert}', expected '{expected_id}'"
+            }
+
+        # Check certificate validity window
+        import datetime as _dt
+        now = _dt.datetime.utcnow()
+        if now < svid_cert.not_valid_before or now > svid_cert.not_valid_after:
+            return {"attested": False, "spiffe_id": spiffe_id_from_cert, "reason": "SVID certificate is expired or not yet valid"}
+
+        return {"attested": True, "spiffe_id": spiffe_id_from_cert or expected_id, "reason": "Cryptographic attestation verified"}
+
+    except Exception as e:
+        return {"attested": False, "spiffe_id": spiffe_cfg.get("bridge_id", ""), "reason": f"Attestation error: {e}"}
+
+
+# =========================
+# FEATURE 2: mTLS SSL CONTEXT BUILDER
+# Builds an SSL context for mutual TLS: the bridge presents its SVID and
+# requires clients to present a cert signed by the same CA trust bundle.
+# =========================
+
+def build_mtls_ssl_context() -> "ssl.SSLContext | None":
+    """
+    Build an ssl.SSLContext for mTLS using the bridge's SVID as the server cert
+    and the CA bundle as the trust anchor for client verification.
+    Returns None if certs are not available (allows HTTP fallback for local dev).
+    """
+    import ssl
+    _certs_dir = os.path.join(PROJECT_DIR, "spire", "certs")
+    svid_cert  = os.path.join(_certs_dir, "bridge.crt")
+    svid_key   = os.path.join(_certs_dir, "bridge.key")
+    ca_bundle  = os.path.join(_certs_dir, "ca.crt")
+
+    if not all(os.path.exists(p) for p in [svid_cert, svid_key, ca_bundle]):
+        log("[mTLS] SVID or CA bundle not found. mTLS disabled — running HTTP for local dev.")
+        return None
+
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.verify_mode = ssl.CERT_REQUIRED          # Require client cert
+        ctx.load_cert_chain(certfile=svid_cert, keyfile=svid_key)
+        ctx.load_verify_locations(cafile=ca_bundle)  # Trust only our CA
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        log("[mTLS] SSL context ready: bridge SVID loaded, client cert verification enforced.")
+        return ctx
+    except Exception as e:
+        log(f"[mTLS] SSL context build failed: {e}. Falling back to HTTP.")
+        return None
+
+
+# =========================
+# FEATURE 3: STRICT SVID CRYPTOGRAPHIC VERIFICATION
+# At request time, verify the X.509 SVID presented in the X-SPIFFE-ID header
+# by checking that the cert (if attached) is signed by the trusted CA bundle,
+# not expired, and carries the claimed SPIFFE URI in its SAN.
+# =========================
+
+def verify_svid_cryptographically(spiffe_id: str, cert_pem: str | None = None) -> dict:
+    """
+    Strict SVID verification:
+      1. If a PEM cert is provided, verify it against the CA bundle.
+      2. Extract the SPIFFE URI SAN from the cert.
+      3. Confirm it matches the claimed spiffe_id.
+      4. Check it's not expired.
+
+    Returns dict: {valid: bool, reason: str}
+    Falls back to allowlist-only check when no cert is provided (offline mode).
+    """
+    if not cert_pem:
+        # No cert attached — fall back to allowlist check (header-only mode)
+        if spiffe_allowed(spiffe_id):
+            return {"valid": True, "reason": "Allowlist match (no cert presented)"}
+        return {"valid": False, "reason": f"SPIFFE ID '{spiffe_id}' not in allowlist and no cert presented"}
+
+    try:
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.backends import default_backend
+
+        _certs_dir = os.path.join(PROJECT_DIR, "spire", "certs")
+        ca_bundle = os.path.join(_certs_dir, "ca.crt")
+        if not os.path.exists(ca_bundle):
+            # No CA bundle — fall back to allowlist
+            if spiffe_allowed(spiffe_id):
+                return {"valid": True, "reason": "Allowlist match (CA bundle unavailable)"}
+            return {"valid": False, "reason": "CA bundle unavailable and ID not in allowlist"}
+
+        with open(ca_bundle, "rb") as f:
+            ca_cert = _x509.load_pem_x509_certificate(f.read(), default_backend())
+
+        svid_cert = _x509.load_pem_x509_certificate(cert_pem.encode(), default_backend())
+
+        # Step 1 — Verify signature against CA
+        from cryptography.hazmat.primitives.asymmetric import padding as _padding
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+
+        ca_public_key = ca_cert.public_key()
+        if isinstance(ca_public_key, _rsa.RSAPublicKey):
+            ca_public_key.verify(
+                svid_cert.signature,
+                svid_cert.tbs_certificate_bytes,
+                _padding.PKCS1v15(),
+                svid_cert.signature_hash_algorithm,
+            )
+        elif isinstance(ca_public_key, _ec.EllipticCurvePublicKey):
+            ca_public_key.verify(
+                svid_cert.signature,
+                svid_cert.tbs_certificate_bytes,
+                _ec.ECDSA(svid_cert.signature_hash_algorithm),
+            )
+        else:
+            ca_public_key.verify(
+                svid_cert.signature,
+                svid_cert.tbs_certificate_bytes,
+                svid_cert.signature_hash_algorithm,
+            )
+
+        # Step 2 — Extract SPIFFE URI SAN from cert
+        cert_spiffe_id = ""
+        try:
+            san = svid_cert.extensions.get_extension_for_class(_x509.SubjectAlternativeName)
+            uris = san.value.get_values_for_type(_x509.UniformResourceIdentifier)
+            spiffe_uris = [u for u in uris if u.startswith("spiffe://")]
+            cert_spiffe_id = spiffe_uris[0] if spiffe_uris else ""
+        except Exception:
+            pass
+
+        # Step 3 — SAN must match the claimed header value
+        if cert_spiffe_id and cert_spiffe_id != spiffe_id:
+            return {"valid": False, "reason": f"SVID SAN '{cert_spiffe_id}' does not match claimed '{spiffe_id}'"}
+
+        # Step 4 — Validity window
+        import datetime as _dt
+        now = _dt.datetime.utcnow()
+        if now < svid_cert.not_valid_before or now > svid_cert.not_valid_after:
+            return {"valid": False, "reason": "SVID certificate is expired or not yet valid"}
+
+        # Step 5 — Allowlist check on the cert's SPIFFE ID
+        verified_id = cert_spiffe_id or spiffe_id
+        if not spiffe_allowed(verified_id):
+            return {"valid": False, "reason": f"SVID '{verified_id}' not in allowlist"}
+
+        return {"valid": True, "reason": f"SVID cryptographically verified: {verified_id}"}
+
+    except Exception as e:
+        # Crypto verification failed — hard reject (not a fallback)
+        return {"valid": False, "reason": f"SVID cryptographic verification failed: {e}"}
 
 
 # =========================
@@ -677,7 +1527,7 @@ def get_token_scopes(token):
     if isinstance(scopes, str):
         scopes = scopes.split(" ")
     
-    roles = decoded.get("realm_access", {}).get("roles", [])
+    roles = decoded.get("realm_access", {}).get("roles", []) or decoded.get("roles", [])
     return list(set(scopes + roles))
 
 def is_scope_allowed(required_scope, token_scopes):
@@ -685,19 +1535,48 @@ def is_scope_allowed(required_scope, token_scopes):
         return True
     return required_scope in token_scopes
 
+def resolve_userid_by_sub(sub: str) -> str:
+    """Look up userId in the sqlite database using the keycloak_sub claim."""
+    if not sub:
+        return "1"  # Default fallback
+    db_path = os.path.join(PROJECT_DIR, "damn-vulnerable-llm-agent", "transactions.db")
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT userId FROM Users WHERE keycloak_sub = ?", (sub,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return str(row[0])
+    except Exception as e:
+        log(f"⚠️ Error resolving userId by sub '{sub}': {e}")
+    return "1"  # Default fallback
+
+
 
 # ==========================================
 # SECURE OPENAI-COMPATIBLE PROXY ENDPOINT
 # ==========================================
 
-async def handle_mock_llm_response(body: dict, user_id: str, user_role: str):
+async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, user_sub: str = ""):
     messages = body.get("messages", [])
+    
+    # Settle Turn boundaries to prevent state leakage/re-entry from previous turns in conversation history
+    last_final_answer_idx = -1
+    for i, msg in enumerate(messages):
+        role = msg.get("role")
+        content = msg.get("content", "") or ""
+        if role == "assistant" and ("Final Answer" in content or '"action": "Final Answer"' in content):
+            last_final_answer_idx = i
+
+    current_turn_messages = messages[last_final_answer_idx + 1:] if last_final_answer_idx != -1 else messages
     
     get_user_called = False
     get_trans_called = False
     last_user_prompt = ""
     
-    for msg in messages:
+    for msg in current_turn_messages:
         role = msg.get("role")
         content = msg.get("content", "") or ""
         if role == "user":
@@ -722,8 +1601,8 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str):
                 elif func_name == "GetUserTransactions":
                     get_trans_called = True
 
-    # Robust detection over full message sequence
-    for msg in messages:
+    # Robust detection over current turn message sequence
+    for msg in current_turn_messages:
         c = msg.get("content", "") or ""
         if "GetCurrentUser" in c:
             get_user_called = True
@@ -742,6 +1621,34 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str):
     model_name = body.get("model", "gpt-4")
 
     async def yield_response_chunks(content_text: str):
+        # Scan and redact outbound PII from the mock LLM response before streaming it
+        orig_content = content_text
+        
+        # Check if the content is a structured ReAct tool call JSON block (Option 1)
+        # We only want to redact the final answer shown to the user (Option 2)
+        # to avoid mutilating tool arguments (like user IDs) which are already validated and redacted at the tool boundary.
+        is_tool_call = False
+        if "action" in content_text and '"action": "Final Answer"' not in content_text:
+            is_tool_call = True
+
+        if user_role == "admin" or is_tool_call:
+            redacted_content = content_text
+        else:
+            redacted_content = redact_pii_with_presidio(content_text)
+            
+        if redacted_content != orig_content:
+            log("✂️ FIREWALL REDACTED sensitive data (Mock Outbound Fallback)")
+            dashboard_state.add_event({
+                "action": "redact",
+                "tool": "chat_completion",
+                "agent": "mock-llm-agent",
+                "reason": "Outbound PII Redacted from mock LLM response",
+                "severity": "medium",
+                "stage": "pii-redaction-outbound",
+                "timestamp": time.time()
+            })
+            content_text = redacted_content
+
         chunk_id = f"chatcmpl-{int(time.time())}"
         
         delta_role = {"role": "assistant", "content": ""}
@@ -778,15 +1685,17 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str):
         formatted = format_final_answer(text)
         return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 
+    target_user_id = resolve_userid_by_sub(user_sub)
     if any(w in last_prompt_lower for w in ["transaction", "show", "get", "list"]):
         has_hijacking_attempt = re.search(r'\b(user\s*id|user_?id|user)\b\s*(=?\s*\b\d+\b)', last_prompt_lower)
         hijacked_id = None
         if has_hijacking_attempt:
             val = has_hijacking_attempt.group(2).replace("=", "").strip()
-            if val != "1":
+            if val != target_user_id:
                 hijacked_id = val
+                target_user_id = val
 
-        if hijacked_id:
+        if hijacked_id and user_role != "admin":
             reason = f"Security Violation: Refusing to fetch transactions for userId '{hijacked_id}'. I will only fetch transactions for the authenticated user ID returned by the GetCurrentUser tool."
             dashboard_state.add_event({
                 "action": "deny",
@@ -829,16 +1738,40 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str):
                 "action": "allow",
                 "tool": "GetUserTransactions",
                 "agent": "mock-llm-agent",
-                "reason": "Agent requesting bank transactions for authenticated userId: 1",
+                "reason": f"Agent requesting bank transactions for authenticated userId: {target_user_id}",
                 "severity": "low",
                 "stage": "agent-reasoning",
                 "timestamp": time.time()
             })
-            formatted = format_action("GetUserTransactions", {"userId": "1"})
+            formatted = format_action("GetUserTransactions", {"userId": target_user_id})
             return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
             
         elif get_trans_called:
-            text = "Here are your recent bank transactions:\n\n| Date | Description | Amount |\n| --- | --- | --- |\n| 2026-05-18 | Grocery Store | -$42.50 |\n| 2026-05-17 | Salary Credit | +$3500.00 |\n| 2026-05-15 | Coffee Shop | -$5.80 |\n| 2026-05-14 | Electric Bill | -$120.00 |\n\nAll transactions have been successfully retrieved and processed."
+            # Try to find the actual tool output in the message history to make the mock LLM dynamically display actual database results!
+            tool_output = None
+            for msg in current_turn_messages:
+                if msg.get("name") == "GetUserTransactions" or (msg.get("role") == "tool" and msg.get("name") == "GetUserTransactions"):
+                    c = msg.get("content", "")
+                    if c and "[" in c and "]" in c:
+                        tool_output = c
+                        break
+            
+            formatted_table = ""
+            if tool_output:
+                try:
+                    txs = json.loads(tool_output)
+                    if isinstance(txs, list) and len(txs) > 0:
+                        formatted_table = "\n\n| Transaction ID | User ID | Reference | Recipient | Amount |\n| --- | --- | --- | --- | --- |\n"
+                        for tx in txs:
+                            formatted_table += f"| {tx.get('transactionId', '')} | {tx.get('userId', '')} | {tx.get('reference', '')} | {tx.get('recipient', '')} | ${tx.get('amount', 0.0):.2f} |\n"
+                except Exception as e:
+                    log(f"⚠️ Failed to parse dynamic tool transactions: {e}")
+            
+            if formatted_table:
+                text = f"Here are the requested bank transactions retrieved from the secure database:{formatted_table}\n\nAll transactions have been successfully retrieved and processed."
+            else:
+                text = "Here are your recent bank transactions:\n\n| Date | Description | Amount |\n| --- | --- | --- |\n| 2026-05-18 | Grocery Store | -$42.50 |\n| 2026-05-17 | Salary Credit | +$3500.00 |\n| 2026-05-15 | Coffee Shop | -$5.80 |\n| 2026-05-14 | Electric Bill | -$120.00 |\n\nAll transactions have been successfully retrieved and processed."
+
             dashboard_state.add_event({
                 "action": "allow",
                 "tool": "chat_completion",
@@ -856,9 +1789,191 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str):
     return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 
 
+# =============================================================================
+# DYNAMIC NEMO CONFIG ENDPOINTS  (hot-reload without restarting the bridge)
+# =============================================================================
+
+@dashboard_app.get("/config/nemo")
+async def get_nemo_config():
+    """Return the currently active NeMo Guardrails config (live, in-memory)."""
+    global nim_guard_instance
+    if nim_guard_instance is None:
+        return JSONResponse(status_code=503, content={"error": "NeMo guard not initialised"})
+    return JSONResponse(content={
+        "enabled":        nim_guard_instance.config.get("enabled", False),
+        "jailbreak_rail": nim_guard_instance.config.get("jailbreak_rail", {}),
+        "pii_rail":       nim_guard_instance.config.get("pii_rail", {}),
+        "topical_rail":   nim_guard_instance.config.get("topical_rail", {}),
+    })
+
+
+@dashboard_app.post("/config/reload")
+async def reload_nemo_config():
+    """Re-read mcp-firewall.yaml from disk and apply changes immediately — no restart needed."""
+    global nim_guard_instance
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            fresh = yaml.safe_load(f) or {}
+        new_nemo_cfg = fresh.get("nemo_cloud", {})
+        if nim_guard_instance is None:
+            return JSONResponse(status_code=503, content={"error": "NeMo guard not initialised"})
+        nim_guard_instance.config = new_nemo_cfg          # hot-swap in-memory config
+        log("🔄 NeMo config reloaded from disk")
+        return JSONResponse(content={"status": "reloaded", "nemo_cloud": new_nemo_cfg})
+    except Exception as e:
+        log(f"❌ Config reload failed: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@dashboard_app.patch("/config/nemo")
+async def patch_nemo_config(request: Request):
+    """
+    Update NeMo Guardrails config fields at runtime without editing the YAML.
+
+    Accepted JSON body fields (all optional):
+      - enabled            (bool)
+      - allowed_topics     (list[str])   — replaces the topical_rail allow-list
+      - blocked_topics     (list[str])   — replaces the topical_rail block-list
+      - detect_entities    (list[str])   — replaces pii_rail detect_entities
+      - jailbreak_enabled  (bool)
+      - jailbreak_severity (float 0-1)
+      - pii_enabled        (bool)
+      - topical_enabled    (bool)
+
+    Example:
+      PATCH /config/nemo
+      {"blocked_topics": ["Crypto trading", "Medical diagnosis"]}
+    """
+    global nim_guard_instance
+    if nim_guard_instance is None:
+        return JSONResponse(status_code=503, content={"error": "NeMo guard not initialised"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
+
+    cfg = nim_guard_instance.config  # reference to live dict — mutate directly
+
+    # Top-level enabled flag
+    if "enabled" in body:
+        cfg["enabled"] = bool(body["enabled"])
+
+    # Jailbreak rail
+    jb = cfg.setdefault("jailbreak_rail", {})
+    if "jailbreak_enabled" in body:
+        jb["enabled"] = bool(body["jailbreak_enabled"])
+    if "jailbreak_severity" in body:
+        val = float(body["jailbreak_severity"])
+        jb["severity_threshold"] = max(0.0, min(1.0, val))  # clamp 0-1
+
+    # PII rail
+    pii = cfg.setdefault("pii_rail", {})
+    if "pii_enabled" in body:
+        pii["enabled"] = bool(body["pii_enabled"])
+    if "detect_entities" in body:
+        if not isinstance(body["detect_entities"], list):
+            return JSONResponse(status_code=400, content={"error": "detect_entities must be a list"})
+        pii["detect_entities"] = body["detect_entities"]
+
+    # Topical rail
+    tp = cfg.setdefault("topical_rail", {})
+    if "topical_enabled" in body:
+        tp["enabled"] = bool(body["topical_enabled"])
+    if "allowed_topics" in body:
+        if not isinstance(body["allowed_topics"], list):
+            return JSONResponse(status_code=400, content={"error": "allowed_topics must be a list"})
+        tp["allowed_topics"] = body["allowed_topics"]
+    if "blocked_topics" in body:
+        if not isinstance(body["blocked_topics"], list):
+            return JSONResponse(status_code=400, content={"error": "blocked_topics must be a list"})
+        tp["blocked_topics"] = body["blocked_topics"]
+
+    log(f"⚙️ NeMo config patched at runtime: {list(body.keys())}")
+    return JSONResponse(content={
+        "status":  "patched",
+        "changed": list(body.keys()),
+        "nemo_cloud": cfg,
+    })
+
+
 @dashboard_app.post("/v1/chat/completions")
 async def chat_completions_proxy(request: Request):
     global gateway_instance, nim_guard_instance, fraud_engine_instance
+
+    # Reload environment to pick up persona shifts dynamically
+    try:
+        load_dotenv(dotenv_path=DOTENV_PATH, override=True)
+    except Exception:
+        pass
+
+    env_role = os.getenv("RUNTIME_ROLE", "user").strip().lower().replace("'", "").replace('"', '')
+
+    # --- SPIFFE WORKLOAD IDENTITY ENFORCEMENT (Strict SVID Cryptographic Verification) ---
+    spiffe_cfg = get_spiffe_config()
+    if spiffe_cfg["enabled"]:
+        spiffe_id = request.headers.get("X-SPIFFE-ID") or request.headers.get("x-spiffe-id")
+        # Optional: caller may present their full PEM cert for cryptographic verification
+        cert_pem  = request.headers.get("X-SPIFFE-CERT") or request.headers.get("x-spiffe-cert")
+
+        if not spiffe_id:
+            log("SPIFFE violation on HTTP completions: missing service identity header")
+            dashboard_state.add_event({
+                "action": "block",
+                "tool": "chat_completion",
+                "agent": "llm-agent",
+                "reason": "Missing SPIFFE ID header on completions endpoint",
+                "severity": "high",
+                "stage": "spiffe-auth",
+                "timestamp": time.time()
+            })
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "message": "Access Denied: Missing required X-SPIFFE-ID identity header",
+                        "type": "spiffe_violation",
+                        "code": "missing_spiffe_identity"
+                    }
+                }
+            )
+
+        # Feature 3: Strict SVID cryptographic verification
+        svid_check = verify_svid_cryptographically(spiffe_id, cert_pem)
+        if not svid_check["valid"]:
+            log(f"SPIFFE violation on HTTP completions: {svid_check['reason']}")
+            dashboard_state.add_event({
+                "action": "block",
+                "tool": "chat_completion",
+                "agent": "llm-agent",
+                "reason": svid_check["reason"],
+                "severity": "high",
+                "stage": "spiffe-auth",
+                "timestamp": time.time()
+            })
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "message": f"Access Denied: {svid_check['reason']}",
+                        "type": "spiffe_violation",
+                        "code": "unauthorized_spiffe_identity"
+                    }
+                }
+            )
+        else:
+            log(f"SPIFFE SVID verified for completions proxy: {svid_check['reason']}")
+            # Send dynamic SPIFFE validation event to dashboard
+            dashboard_state.add_event({
+                "action": "allow",
+                "tool": "chat_completion",
+                "agent": "(spiffe)",
+                "identity": spiffe_id,
+                "reason": f"SVID signature & SAN cryptographically verified",
+                "severity": "info",
+                "stage": "spiffe-auth",
+                "timestamp": time.time()
+            })
 
     # 1. Parse JSON Request Body
     try:
@@ -875,16 +1990,29 @@ async def chat_completions_proxy(request: Request):
 
     user_id = "anonymous_user"
     user_role = "user"
+    user_sub = ""
     claims = {}
 
     if token:
         try:
+            log(f"DEBUG PROXY RECEIVED TOKEN: {repr(token)}")
             claims = get_token_claims(token)
             user_id = claims.get("preferred_username") or claims.get("sub") or "anonymous_user"
-            roles = claims.get("realm_access", {}).get("roles", [])
+            user_sub = claims.get("sub") or ""
+            log(f"JWT SUB: {user_sub}")
+            roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
             user_role = "admin" if "admin" in roles else "user"
         except Exception as e:
             log(f"⚠️ Proxy failed to decode JWT token: {e}")
+
+    # Local Dev Override/Fallback:
+    # If the user explicitly switched to admin persona in local development,
+    # let's honor the RUNTIME_ROLE from .env even if the mock/Keycloak token doesn't map it properly.
+    if user_role != "admin" and env_role == "admin":
+        log(f"ℹ️ Local Dev Override: Elevating {user_id} to admin role due to RUNTIME_ROLE=admin in .env")
+        user_role = "admin"
+        if user_id == "anonymous_user":
+            user_id = "admin"
 
     # Extract prompt messages
     messages = body.get("messages", [])
@@ -894,24 +2022,13 @@ async def chat_completions_proxy(request: Request):
     new_pii_detected = False
     redacted_messages = []
     
-    # Redact email patterns, SSN patterns, and credit cards
-    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-    ssn_pattern = r'\b\d{3}-\d{2}-\d{4}\b'
-    phone_pattern = r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'
-    
     for idx, msg in enumerate(messages):
         if msg.get("role") == "user":
             orig = msg.get("content", "")
-            redacted = orig
-            if nim_guard_instance and nim_guard_instance.config.get("enabled") and nim_guard_instance.config.get("pii_rail", {}).get("enabled"):
-                redacted = nim_guard_instance.redact_pii(orig)
+            if user_role == "admin":
+                redacted = orig
             else:
-                # Local regex redaction fallback
-                cc_pattern = r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b'
-                redacted = re.sub(email_pattern, '[REDACTED-EMAIL]', redacted)
-                redacted = re.sub(ssn_pattern, '[REDACTED-SSN]', redacted)
-                redacted = re.sub(phone_pattern, '[REDACTED-PHONE]', redacted)
-                redacted = re.sub(cc_pattern, '[REDACTED-CC]', redacted)
+                redacted = redact_pii_with_presidio(orig)
             
             if redacted != orig:
                 pii_detected = True
@@ -939,7 +2056,7 @@ async def chat_completions_proxy(request: Request):
 
     # 3. Inbound Security Checks: Llama Guard 4 (Jailbreak Detection)
     if nim_guard_instance and nim_guard_instance.config.get("enabled"):
-        jb_blocked, jb_reason = nim_guard_instance.check_jailbreak(user_content)
+        jb_blocked, jb_reason = nim_guard_instance.check_jailbreak(user_content, is_admin=(user_role == "admin"))
         if jb_blocked:
             log(f"🚫 NE-MO BLOCK (Llama Guard): {jb_reason}")
             dashboard_state.add_event({
@@ -1013,16 +2130,8 @@ async def chat_completions_proxy(request: Request):
                     }
                 )
         
-        # Check for PII pattern matches to simulate Llama Guard 4 Category S7 (Private Personal Data)
-        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-        ssn_pattern = r'\b\d{3}-\d{2}-\d{4}\b'
-        phone_pattern = r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'
-        cc_pattern = r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b'
-        
-        has_pii = (re.search(email_pattern, user_content) or 
-                   re.search(ssn_pattern, user_content) or 
-                   re.search(phone_pattern, user_content) or 
-                   re.search(cc_pattern, user_content))
+        # Check for PII matches using Presidio to simulate Llama Guard 4 Category S7 (Private Personal Data)
+        has_pii = False if user_role == "admin" else has_pii_presidio(user_content)
                    
         if has_pii:
             reason = "Llama Guard 4 UNSAFE — Violated categories: s7"
@@ -1075,12 +2184,15 @@ async def chat_completions_proxy(request: Request):
                     }
                 )
 
+        # Resolve dynamic userId by sub (defaults to "1" if sub not mapped or empty)
+        allowed_userid = resolve_userid_by_sub(user_sub)
+
         # Rule B: Prompt ID Hijacking check (prevent standard user from asking for other userIds)
         has_hijacking_attempt = re.search(r'\b(user\s*id|user_?id|user)\b\s*(=?\s*\b\d+\b)', user_content.lower())
         if has_hijacking_attempt:
             val = has_hijacking_attempt.group(2).replace("=", "").strip()
-            if val != "1":
-                reason = f"RBAC Violation: Refusing to fetch transactions for userId '{val}'. User '{user_id}' (role '{user_role}') is only authorized to access userId '1'."
+            if val != allowed_userid:
+                reason = f"RBAC Violation: Refusing to fetch transactions for userId '{val}'. User '{user_id}' (role '{user_role}') is only authorized to access userId '{allowed_userid}'."
                 log(f"🚫 RBAC BLOCK: {reason}")
                 dashboard_state.add_event({
                     "action": "deny",
@@ -1111,8 +2223,8 @@ async def chat_completions_proxy(request: Request):
                     try:
                         args = json.loads(func.get("arguments", "{}"))
                         u_id = str(args.get("userId", "")).strip()
-                        if u_id and u_id != "1":
-                            reason = f"RBAC Violation: User '{user_id}' (role '{user_role}') is not authorized to call GetUserTransactions for userId '{u_id}'. Access is restricted to own userId '1'."
+                        if u_id and u_id != allowed_userid:
+                            reason = f"RBAC Violation: User '{user_id}' (role '{user_role}') is not authorized to call GetUserTransactions for userId '{u_id}'. Access is restricted to own userId '{allowed_userid}'."
                             log(f"🚫 RBAC BLOCK: {reason}")
                             dashboard_state.add_event({
                                 "action": "deny",
@@ -1180,17 +2292,26 @@ async def chat_completions_proxy(request: Request):
     # 7. Check if running in Mock LLM Mode
     openai_key = os.getenv("OPENAI_API_KEY")
     hf_token = os.getenv("HF_TOKEN")
+    nvidia_key = os.getenv("NVIDIA_API_KEY")
+    nim_base_url = os.getenv("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
     
     requested_model = body.get("model", "gpt-4o")
     log(f"📋 Received request for model: '{requested_model}'")
-    is_huggingface = requested_model.startswith("huggingface/") or "llama-3.1" in requested_model.lower() or "meta-llama" in requested_model.lower()
     
-    if is_huggingface:
-        pass # Force real upstream requests even if hf_token is missing (it will fail cleanly upstream)
+    is_nvidia = False
+    if nvidia_key and ("llama-3.1" in requested_model.lower() or "meta-llama" in requested_model.lower() or "nvidia" in requested_model.lower()):
+        is_nvidia = True
+
+    is_huggingface = False
+    if not is_nvidia:
+        is_huggingface = requested_model.startswith("huggingface/") or "llama-3.1" in requested_model.lower() or "meta-llama" in requested_model.lower()
+    
+    if is_huggingface or is_nvidia:
+        pass # Force real upstream requests even if hf_token or nvidia_key is missing (it will fail cleanly upstream)
     else:
         if not openai_key or openai_key == "mock-key-for-local-demo":
             log("🤖 Zero-Key Mock LLM Mode activated")
-            return await handle_mock_llm_response(body, user_id, user_role)
+            return await handle_mock_llm_response(body, user_id, user_role, user_sub)
 
     # 8. Standard Mode: Forward Request to Upstream LLM
     target_url = "https://api.openai.com/v1/chat/completions"
@@ -1198,7 +2319,12 @@ async def chat_completions_proxy(request: Request):
         "Content-Type": "application/json"
     }
 
-    if is_huggingface:
+    if is_nvidia:
+        body["model"] = requested_model
+        target_url = f"{nim_base_url.rstrip('/')}/chat/completions"
+        headers["Authorization"] = f"Bearer {nvidia_key}"
+        log(f"🛤️ Proxying authenticated chat completion request to NVIDIA NIM model '{requested_model}' via NIM API for user: {user_id}")
+    elif is_huggingface:
         if requested_model.startswith("huggingface/"):
             model_id = requested_model[len("huggingface/"):]
         else:
@@ -1261,20 +2387,16 @@ async def chat_completions_proxy(request: Request):
                                 log(f"⚠️ Stream chunk parsing error: {e}")
 
             full_text = "".join(accumulated_content)
+            log(f"💬 Upstream LLM Response: {full_text}")
+            
+            # Sanitize JSON response to prevent Pydantic string validation errors
+            full_text = sanitize_llm_json(full_text)
             redacted_text = full_text
             
-            email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-            ssn_pattern = r'\b\d{3}-\d{2}-\d{4}\b'
-            phone_pattern = r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'
-            cc_pattern = r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b'
-
-            if nim_guard_instance and nim_guard_instance.config.get("enabled"):
-                redacted_text = nim_guard_instance.redact_pii(full_text)
+            if user_role == "admin" or is_tool_call(full_text):
+                redacted_text = full_text
             else:
-                redacted_text = re.sub(email_pattern, '[REDACTED-EMAIL]', redacted_text)
-                redacted_text = re.sub(ssn_pattern, '[REDACTED-SSN]', redacted_text)
-                redacted_text = re.sub(phone_pattern, '[REDACTED-PHONE]', redacted_text)
-                redacted_text = re.sub(cc_pattern, '[REDACTED-CC]', redacted_text)
+                redacted_text = redact_pii_with_presidio(full_text)
             
             if redacted_text != full_text:
                 log("✂️ Outbound PII Redacted from stream")
@@ -1361,20 +2483,24 @@ async def chat_completions_proxy(request: Request):
             if "model" not in resp_data:
                 resp_data["model"] = requested_model
 
-            # Outbound PII Redaction
+            # Outbound PII Redaction & JSON Sanitization
             choices = resp_data.get("choices", [])
             outbound_redacted = False
             for choice in choices:
                 msg = choice.get("message", {})
                 content = msg.get("content", "")
                 if content:
-                    redacted = content
-                    if nim_guard_instance and nim_guard_instance.config.get("enabled"):
-                        redacted = nim_guard_instance.redact_pii(content)
+                    # Sanitize JSON response to prevent Pydantic string validation errors
+                    sanitized = sanitize_llm_json(content)
+                    if sanitized != content:
+                        msg["content"] = sanitized
+                        outbound_redacted = True
+                        content = sanitized
+                        
+                    if user_role == "admin" or is_tool_call(content):
+                        redacted = content
                     else:
-                        redacted = re.sub(email_pattern, '[REDACTED-EMAIL]', redacted)
-                        redacted = re.sub(ssn_pattern, '[REDACTED-SSN]', redacted)
-                        redacted = re.sub(phone_pattern, '[REDACTED-PHONE]', redacted)
+                        redacted = redact_pii_with_presidio(content)
                     
                     if redacted != content:
                         msg["content"] = redacted
@@ -1410,6 +2536,8 @@ async def chat_completions_proxy(request: Request):
 # =========================
 
 def main():
+    # Warm up Microsoft Presidio NLP engine synchronously before starting servers
+    _warmup_presidio_sync()
     parser = argparse.ArgumentParser(description="MCP Security Bridge & Scanner")
     parser.add_argument("--scan", action="store_true", help="Only run the security scan")
     parser.add_argument("--learning", action="store_true", help="Enable Learning Mode (log unknown tools instead of blocking)")
@@ -2079,12 +3207,14 @@ setInterval(() => {
                         log(f"⚠️ NON-JSON OUTPUT from {provider_name}: {line_str.strip()}")
                         continue # Skip relaying this line to real_stdout
 
+                    current_role = normalize_role(None)
+
                     # --- NE-MO NIM CLOUD PII REDACTION ---
-                    if nim_guard.config.get("enabled") and nim_guard.config.get("pii_rail", {}).get("enabled"):
+                    if current_role != "admin" and nim_guard.config.get("enabled") and nim_guard.config.get("pii_rail", {}).get("enabled"):
                         # Only redact if it looks like there's actual content (not just protocol overhead)
                         if '"result":' in line_str or '"content":' in line_str:
                             old_len = len(line_str)
-                            line_str = nim_guard.redact_pii(line_str)
+                            line_str = nim_guard.redact_pii(line_str, role=current_role)
                             if len(line_str) != old_len:
                                 log("✂️ NE-MO NIM REDACTED sensitive data")
                                 dashboard_state.add_event({
@@ -2097,41 +3227,42 @@ setInterval(() => {
                                     "timestamp": time.time()
                                 })
 
-                    redacted_result = gw.scan_response(line_str)
-                    
-                    # Manual Redaction Fallback (ensures emails are caught even if SDK matching lags)
-                    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-                    manual_redacted = re.sub(email_pattern, '[REDACTED]', line_str)
-                    
-                    if redacted_result.modified:
-                        log("✂️ FIREWALL REDACTED sensitive data")
-                        line_str = redacted_result.content
+                    if current_role != "admin":
+                        redacted_result = gw.scan_response(line_str)
                         
-                        for finding in redacted_result.findings:
+                        # Manual Redaction Fallback (ensures emails are caught even if SDK matching lags)
+                        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+                        manual_redacted = re.sub(email_pattern, '[REDACTED]', line_str)
+                        
+                        if redacted_result.modified:
+                            log("✂️ FIREWALL REDACTED sensitive data")
+                            line_str = redacted_result.content
+                            
+                            for finding in redacted_result.findings:
+                                dashboard_state.add_event({
+                                    "action": "redact",
+                                    "tool": "(response)",
+                                    "agent": "claude-desktop",
+                                    "reason": finding.get("reason", "Sensitive data"),
+                                    "severity": finding.get("severity", "medium"),
+                                    "stage": "output-filter",
+                                    "timestamp": time.time()
+                                })
+                        elif manual_redacted != line_str:
+                            log("✂️ FIREWALL REDACTED sensitive data (Manual Fallback)")
+                            line_str = manual_redacted
                             dashboard_state.add_event({
                                 "action": "redact",
                                 "tool": "(response)",
                                 "agent": "claude-desktop",
-                                "reason": finding.get("reason", "Sensitive data"),
-                                "severity": finding.get("severity", "medium"),
-                                "stage": "output-filter",
+                                "reason": "Email PII (Fallback)",
+                                "severity": "medium",
+                                "stage": "output-filter-fallback",
                                 "timestamp": time.time()
                             })
-                    elif manual_redacted != line_str:
-                        log("✂️ FIREWALL REDACTED sensitive data (Manual Fallback)")
-                        line_str = manual_redacted
-                        dashboard_state.add_event({
-                            "action": "redact",
-                            "tool": "(response)",
-                            "agent": "claude-desktop",
-                            "reason": "Email PII (Fallback)",
-                            "severity": "medium",
-                            "stage": "output-filter-fallback",
-                            "timestamp": time.time()
-                        })
 
-                        if not line_str.endswith("\n"):
-                            line_str += "\n"
+                            if not line_str.endswith("\n"):
+                                line_str += "\n"
 
                 except Exception as e:
                     log(f"⚠️ Redaction error: {e}")

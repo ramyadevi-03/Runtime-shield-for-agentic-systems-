@@ -183,6 +183,39 @@ class PIIConfig(BaseModel):
 
     enabled: bool = False  # off by default
     action: Action = Action.REDACT
+    # Severity of the PII finding — configurable via YAML (low/medium/high/critical)
+    severity: Severity = Severity.MEDIUM
+    # Default redaction label used when a pattern has no per-pattern placeholder
+    placeholder: str = "[PII REDACTED by mcp-firewall]"
+    # NVIDIA NIM model for AI-powered semantic redaction (overrides NIM_MODEL env var)
+    nim_model: str = ""
+    # Custom AI DLP system prompt — leave empty to use the built-in default
+    nim_system_prompt: str = ""
+    # presidio_entities: leave empty (or set to ["ALL"]) to auto-detect ALL Presidio entity types.
+    # Populate with specific names (e.g. ["EMAIL_ADDRESS", "US_SSN"]) to restrict to a subset.
+    presidio_entities: list[str] = Field(default_factory=list)
+    # presidio_exclude_entities: specific entity types to ignore/filter out when auto-detecting ALL.
+    presidio_exclude_entities: list[str] = Field(default_factory=list)
+    # presidio_operators: per-entity redaction labels. Entities not listed here fall back to `placeholder`.
+    presidio_operators: dict[str, str] = Field(default_factory=lambda: {
+        "EMAIL_ADDRESS": "[REDACTED-EMAIL]",
+        "US_SSN": "[REDACTED-SSN]",
+        "PHONE_NUMBER": "[REDACTED-PHONE]",
+        "CREDIT_CARD": "[REDACTED-CC]"
+    })
+    regex_fallbacks: list[dict[str, str]] = Field(default_factory=lambda: [
+        {"name": "Credit Card Fallback", "pattern": r"\b\d{4}-\d{4}-\d{4}-\d{4}\b", "placeholder": "[REDACTED-CC]"},
+        {"name": "Phone Fallback", "pattern": r"\b\d{3}-\d{4}\b", "placeholder": "[REDACTED-PHONE]"}
+    ])
+    outbound_patterns: list[dict[str, str]] = Field(default_factory=lambda: [
+        {"name": "Email Address", "pattern": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "placeholder": "[PII REDACTED by mcp-firewall]"},
+        {"name": "Phone (International)", "pattern": r"\+\d{1,3}[\s.-]?\(?\d{1,4}\)?[\s.-]?\d{2,4}[\s.-]?\d{2,4}[\s.-]?\d{0,4}", "placeholder": "[PII REDACTED by mcp-firewall]"},
+        {"name": "SSN (US)", "pattern": r"\b\d{3}-\d{2}-\d{4}\b", "placeholder": "[PII REDACTED by mcp-firewall]"},
+        {"name": "Credit Card", "pattern": r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b", "placeholder": "[PII REDACTED by mcp-firewall]"},
+        {"name": "IBAN", "pattern": r"\b[A-Z]{2}\d{2}[A-Z0-9]{4,30}\b", "placeholder": "[PII REDACTED by mcp-firewall]"},
+        {"name": "AHV (Swiss SSN)", "pattern": r"\b756\.\d{4}\.\d{4}\.\d{2}\b", "placeholder": "[PII REDACTED by mcp-firewall]"},
+        {"name": "IPv4 Address", "pattern": r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b", "placeholder": "[PII REDACTED by mcp-firewall]"}
+    ])
 
 
 class AgentConfig(BaseModel):
