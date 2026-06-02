@@ -106,8 +106,8 @@ def generate_certs(output_dir):
         print(f"SVID written: {workload_name}.crt  [SPIFFE URI: {spiffe_id}]")
 
     # Backward-compat aliases for existing .env references
-    _alias(output_dir, "bridge.crt", "agent.crt")
-    _alias(output_dir, "bridge.key", "agent.key")
+    _alias(output_dir, "agent.crt", "bridge.crt")
+    _alias(output_dir, "agent.key", "bridge.key")
     print(f"\nAll SVIDs written to: {output_dir}")
 
 

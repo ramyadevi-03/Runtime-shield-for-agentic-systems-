@@ -25,6 +25,31 @@ class PolicyEngine(InboundStage):
     stage = PipelineStage.POLICY
 
     def evaluate(self, request: ToolCallRequest, config: GatewayConfig) -> PipelineDecision | None:
+        # Path traversal and absolute path hardening before any policy checks
+        for key in ["path", "directory"]:
+            if key in request.arguments and isinstance(request.arguments[key], str):
+                path_val = request.arguments[key]
+                # Replace backslashes with forward slashes for unified check
+                normalized = path_val.replace("\\", "/")
+                
+                # Split segments to check traversal elements exactly
+                segments = [s.strip() for s in normalized.split("/") if s.strip()]
+                
+                has_traversal = ".." in segments or any(s == ".." or s.startswith("..") or s.endswith("..") for s in segments)
+                has_trailing_dot = normalized.endswith("/.") or normalized.endswith("/..") or normalized == "." or normalized == ".."
+                is_absolute = normalized.startswith("/") or ":" in normalized or normalized.startswith("//")
+                
+                if has_traversal or has_trailing_dot or is_absolute:
+                    return self._deny(
+                        "Security violation: Potential directory traversal or absolute path escape detected.",
+                        severity=Severity.HIGH
+                    )
+                
+                # Apply normalization
+                norm_path = os.path.normpath(path_val)
+                # Keep forward slashes for matching compatibility
+                request.arguments[key] = norm_path.replace("\\", "/")
+
         # 1. Check tenant-specific roles first
         tenant_roles = config.tenants.get(request.tenant_id)
         if tenant_roles:

@@ -1,4 +1,4 @@
-# 🛡️ Runtime Shield for Agentic Systems — Complete Project Walkthrough
+# 🛡️ Runtime Shield — Complete Walkthrough of Centralized LLM-Agnostic Runtime Governance
 
 > [!NOTE]
 > This document explains **every single file**, how they connect, and how the entire system works — written for someone who is brand new to the project. It provides absolute links to the files and main code symbols to let you navigate the codebase instantly.
@@ -7,9 +7,9 @@
 
 ## 1. What Is This Project? (The Big Picture)
 
-Imagine you have an **AI assistant** (like Claude Desktop) that can use "tools" — it can read files, list users, write files, etc. But what if the AI gets **tricked by a malicious prompt (prompt injection)** into reading your passwords, accessing admin-only data, or leaking sensitive customer information?
+Imagine you have **autonomous AI agents** (such as Claude Desktop or a custom LLM chatbot) that can use "tools" — reading files, listing users, writing files, etc. But what if an AI gets **tricked by a malicious prompt (prompt injection)** into reading your passwords, accessing admin-only data, or leaking sensitive customer information?
 
-**This project is a Security Shield** that sits **between** the AI agent and the tools it uses. It inspects every single tool call the AI makes and decides:
+**This project implements Centralized LLM-Agnostic Runtime Governance** that sits **between** any AI client and the tools it uses. It inspects every single tool call the AI makes and decides:
 - ✅ **Allow** — safe, go ahead
 - 🚫 **Block** — nope, that's dangerous
 - ✂️ **Redact** — allow it but scrub out sensitive info (like emails, SSNs, credit cards) from the response

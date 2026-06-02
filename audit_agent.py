@@ -37,6 +37,26 @@ def log_audit(msg: str):
     except UnicodeEncodeError:
         print(f"[AUDIT][{timestamp}] {msg.encode('ascii', 'replace').decode('ascii')}")
 
+
+def get_spiffe_headers() -> dict:
+    import urllib.parse
+    headers = {}
+    spiffe_id = os.getenv("SPIFFE_BRIDGE_ID", "spiffe://runtime-shield/bridge")
+    _certs_dir = os.path.join(PROJECT_DIR, "spire", "certs")
+    bridge_crt_path = os.path.join(_certs_dir, "bridge.crt")
+    cert_pem = None
+    if os.path.exists(bridge_crt_path):
+        try:
+            with open(bridge_crt_path, "r", encoding="utf-8") as f:
+                cert_pem = f.read()
+        except Exception:
+            pass
+    headers["X-SPIFFE-ID"] = spiffe_id
+    if cert_pem:
+        headers["X-SPIFFE-CERT"] = urllib.parse.quote(cert_pem)
+    return headers
+
+
 class AuditAgent:
     def __init__(self, api_key: str, base_url: str, fraud_engine=None, dashboard_state=None):
         self.api_key = api_key
@@ -146,7 +166,9 @@ class AuditAgent:
                 ],
                 "max_tokens": 50
             }
-            response = requests.post(endpoint, headers=self.headers, json=data, timeout=30)
+            req_headers = self.headers.copy()
+            req_headers.update(get_spiffe_headers())
+            response = requests.post(endpoint, headers=req_headers, json=data, timeout=30)
             if response.status_code == 200:
                 result = response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                 is_unsafe, score, categories = self._parse_guard_response(result)

@@ -3,7 +3,7 @@ services:
   keycloak:
     container_name: keycloak_mcp
     image: quay.io/keycloak/keycloak:26.5.3
-    command: ["start-dev"]
+    command: ["start-dev", "--features=token-exchange"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: kavss

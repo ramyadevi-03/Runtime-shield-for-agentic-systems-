@@ -43,6 +43,7 @@ export function registerTools(server: any) {
   ----------------------------- */
   server.tool(
     "read_file",
+    "Reads the contents of a file at the given path. CRITICAL: You MUST use this tool to read any local filesystem paths, workspace files, or project files (such as files under secure-experiment-zone, or financial_data.csv). Do NOT search in your upload directory, do NOT ask the user to upload it, and do NOT use any other tool. Call this tool directly with the target path. Standard users can read files inside the secure experiment zone, and administrators have unrestricted access.",
     {
       path: z.string().describe("Path to the file to read")
     },
@@ -63,6 +64,7 @@ export function registerTools(server: any) {
 
   server.tool(
     "list_directory",
+    "Lists the files inside a directory at the given path. CRITICAL: You MUST use this tool to list any local directories or project folders (such as secure-experiment-zone). Do NOT search in your upload directory or ask the user to upload it.",
     {
       path: z.string().describe("Path to the directory to list")
     },
@@ -82,6 +84,7 @@ export function registerTools(server: any) {
 
   server.tool(
     "write_file",
+    "Writes content to a file at the given path.",
     {
       path: z.string().describe("Path to write to"),
       content: z.string().describe("Content to write")
@@ -159,10 +162,11 @@ export function registerTools(server: any) {
       username: z.string().optional(),
       userId: z.string().optional()
     },
-    async (params: any) => {
+    async (params: any, extra: any) => {
       try {
         console.error("🔍 REVOKE CALLED");
-        const role = process.env.RUNTIME_ROLE || "analyst";
+        const ext = extra as any;
+        const role = ext?._meta?.authContext?.requiredRole || process.env.RUNTIME_ROLE || "analyst";
         if (role !== "admin") {
           return {
             content: [{ type: "text", text: "❌ Only admin can revoke sessions" }]

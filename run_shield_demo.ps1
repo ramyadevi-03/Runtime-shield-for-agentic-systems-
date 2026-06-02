@@ -41,8 +41,8 @@ Start-Sleep -Seconds 15
 Write-Host "🚀 Starting Damn Vulnerable LLM Agent (DVLA) Streamlit app..." -ForegroundColor Green
 $dvlaDir = Join-Path -Path $scriptDir -ChildPath "damn-vulnerable-llm-agent"
 if (Test-Path $dvlaDir) {
-    $streamlitJob = Start-Process -FilePath "python" -ArgumentList "-u -m streamlit run main.py --server.port 8501 --browser.gatherUsageStats false" -WorkingDirectory $dvlaDir -WindowStyle Minimized -PassThru
-    Write-Host "✅ Streamlit chatbot launched (PID: $($streamlitJob.Id))." -ForegroundColor Green
+    $streamlitJob = Start-Process -FilePath "python" -ArgumentList "-u -m streamlit run main.py --server.port 8501 --browser.gatherUsageStats false" -WorkingDirectory $dvlaDir -NoNewWindow -RedirectStandardOutput (Join-Path $scriptDir "streamlit_out.log") -RedirectStandardError (Join-Path $scriptDir "streamlit_err.log") -PassThru
+    Write-Host "✅ Streamlit chatbot launched (PID: $($streamlitJob.Id)). Logging to streamlit_err.log." -ForegroundColor Green
 } else {
     Write-Host "⚠️ Chatbot directory 'damn-vulnerable-llm-agent' not found at '$dvlaDir'!" -ForegroundColor Red
 }

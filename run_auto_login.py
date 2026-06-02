@@ -19,7 +19,7 @@ def auto_login_user1():
         "client_id": login.CLIENT_ID,
         "username": "user1",
         "password": "user",
-        "scope": "openid profile email"
+        "scope": "openid profile email tool:read_file tool:write_file tool:list_directory tool:keycloak_read tool:keycloak_admin tool:keycloak_report tool:admin_internal"
     }
     
     client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET")

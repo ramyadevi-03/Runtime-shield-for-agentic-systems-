@@ -21,10 +21,17 @@ MAIN_DOTENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".en
 load_dotenv(DOTENV_PATH, override=True)
 
 
-KEYCLOAK_URL = os.getenv("KEYCLOAK_URL", "http://localhost:8080")
-REALM = os.getenv("KEYCLOAK_REALM", "master")
-CLIENT_ID = os.getenv("KEYCLOAK_CLIENT_ID", "admin-cli")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_URL")
+REALM = os.getenv("KEYCLOAK_REALM")
+CLIENT_ID = os.getenv("KEYCLOAK_CLIENT_ID")
+
+if not all([KEYCLOAK_URL, REALM, CLIENT_ID]):
+    print("\n❌ Error: Missing mandatory Keycloak environment configuration.")
+    print("Please verify that your .env contains: KEYCLOAK_URL, KEYCLOAK_REALM, KEYCLOAK_CLIENT_ID.")
+    sys.exit(1)
+
 REDIRECT_URI = "http://localhost:18080/callback"
+
 
 # Global to store the auth code
 auth_code = None
@@ -105,8 +112,23 @@ def save_and_resolve(access_token):
     except Exception as e:
         print(f"Could not resolve identity: {e}")
 
+def _require_dev_mode(flow_name: str) -> bool:
+    """Gate insecure flows to LOCAL_DEV_MODE=true only. Returns True if allowed."""
+    if os.getenv("LOCAL_DEV_MODE", "false").strip().lower() != "true":
+        print(f"\n❌ [{flow_name}] DISABLED: This flow is only available when LOCAL_DEV_MODE=true.")
+        print("   In production, use Browser Login (Authorization Code + PKCE) only.")
+        return False
+    print(f"\n⚠️  [DEV ONLY] {flow_name} enabled because LOCAL_DEV_MODE=true.")
+    print("   WARNING: This flow must NOT be used in production environments.")
+    return True
+
 def manual_login():
-    print("\n--- Manual Login Fallback ---")
+    # DEV ONLY: Password grant is insecure for production.
+    # Use Authorization Code flow (Browser Login) for production.
+    if not _require_dev_mode("Manual Login (Password Grant)"):
+        return
+
+    print("\n--- Manual Login (DEV ONLY — Password Grant) ---")
     username = input("Username: ")
     password = input("Password: ")
     
@@ -116,7 +138,7 @@ def manual_login():
         "client_id": CLIENT_ID,
         "username": username,
         "password": password,
-        "scope": "openid profile email"
+        "scope": "openid profile email tool:read_file tool:write_file tool:list_directory tool:keycloak_read tool:keycloak_admin tool:keycloak_report tool:admin_internal"
     }
     
     client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET")
@@ -135,14 +157,19 @@ def manual_login():
 def run_login():
     global auth_code
     
+    is_dev = os.getenv("LOCAL_DEV_MODE", "false").strip().lower() == "true"
     print("\nSelect login method:")
-    print("1. Browser Login (Standard Keycloak)")
-    print("2. Manual Login (CLI Keycloak)")
-    print("3. Mock Login (Demo Mode - Fast Switch)")
+    print("1. Browser Login (Authorization Code — Recommended)")
+    print("2. Manual Login (Password Grant — DEV ONLY)" + ("" if is_dev else " [DISABLED — set LOCAL_DEV_MODE=true]"))
+    print("3. Mock Login (Demo Mode — DEV ONLY)" + ("" if is_dev else " [DISABLED — set LOCAL_DEV_MODE=true]"))
     choice = input("[1/2/3]: ")
     
     if choice == "3":
-        print("\n--- SHIELD-FORCE-ONE Quick Identity Switch ---")
+        # DEV ONLY: Mock login creates an unsigned HS256 JWT with synthetic claims.
+        # This MUST NOT be used in production.
+        if not _require_dev_mode("Mock Login (Demo Mode)"):
+            return
+        print("\n--- SHIELD-FORCE-ONE Quick Identity Switch (DEV ONLY) ---")
         print("1. Administrator (👑 Full Control)")
         print("1. Keycloak Admin (Global Access)")
         print("2. Standard Researcher (Sandboxed)")
@@ -221,7 +248,7 @@ def run_login():
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
-        "scope": "openid profile email",
+        "scope": "openid profile email tool:read_file tool:write_file tool:list_directory tool:keycloak_read tool:keycloak_admin tool:keycloak_report tool:admin_internal",
         "redirect_uri": REDIRECT_URI,
         "prompt": "login"
     }

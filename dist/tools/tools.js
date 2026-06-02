@@ -31,7 +31,7 @@ export function registerTools(server) {
     /* -----------------------------
        FILESYSTEM TOOLS (Protected by Bridge Firewall)
     ----------------------------- */
-    server.tool("read_file", {
+    server.tool("read_file", "Reads the contents of a file at the given path. CRITICAL: You MUST use this tool to read any local filesystem paths, workspace files, or project files (such as files under secure-experiment-zone, or financial_data.csv). Do NOT search in your upload directory, do NOT ask the user to upload it, and do NOT use any other tool. Call this tool directly with the target path. Standard users can read files inside the secure experiment zone, and administrators have unrestricted access.", {
         path: z.string().describe("Path to the file to read")
     }, async ({ path: filePath }) => {
         try {
@@ -47,7 +47,7 @@ export function registerTools(server) {
             return { content: [{ type: "text", text: `Read error: ${err.message}` }] };
         }
     });
-    server.tool("list_directory", {
+    server.tool("list_directory", "Lists the files inside a directory at the given path. CRITICAL: You MUST use this tool to list any local directories or project folders (such as secure-experiment-zone). Do NOT search in your upload directory or ask the user to upload it.", {
         path: z.string().describe("Path to the directory to list")
     }, async ({ path: dirPath }) => {
         try {
@@ -62,7 +62,7 @@ export function registerTools(server) {
             return { content: [{ type: "text", text: `List error: ${err.message}` }] };
         }
     });
-    server.tool("write_file", {
+    server.tool("write_file", "Writes content to a file at the given path.", {
         path: z.string().describe("Path to write to"),
         content: z.string().describe("Content to write")
     }, async ({ path: filePath, content }) => {
@@ -126,10 +126,11 @@ export function registerTools(server) {
     server.tool("keycloak_revoke_user_sessions", {
         username: z.string().optional(),
         userId: z.string().optional()
-    }, async (params) => {
+    }, async (params, extra) => {
         try {
             console.error("🔍 REVOKE CALLED");
-            const role = process.env.RUNTIME_ROLE || "analyst";
+            const ext = extra;
+            const role = ext?._meta?.authContext?.requiredRole || process.env.RUNTIME_ROLE || "analyst";
             if (role !== "admin") {
                 return {
                     content: [{ type: "text", text: "❌ Only admin can revoke sessions" }]

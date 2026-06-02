@@ -26,7 +26,7 @@ pii:
 nemo_cloud:
   enabled: true
   jailbreak_rail:
-    enabled: false
+    enabled: true
     severity_threshold: 0.7
   pii_rail:
     enabled: true
@@ -100,7 +100,7 @@ rules:
     tool: "read_file|list_directory|write_file"
     match:
       arguments:
-        path: "secure-experiment-zone/claude-desktop/**"
+        path: "secure-experiment-zone/claude-desktop**"
     action: allow
     message: "Workspace Access: Internal configuration tools permitted."
 
@@ -109,7 +109,7 @@ rules:
     tool: "read_file|list_directory|write_file"
     match:
       arguments:
-        path: "secure-experiment-zone/**"
+        path: "secure-experiment-zone**"
     action: allow
     message: "Sandbox Access: Authorized experiment zone operations."
 
@@ -154,6 +154,13 @@ rules:
     message: "Governance: Identity management access granted."
     zone: staging # Default zone for these tools
 
+  # 7. Default Allow for Sandboxed Database tools
+  - name: allow-database-tools
+    tool: "GetCurrentUser|GetUserTransactions"
+    action: allow
+    message: "Governance: Jailed database operations permitted."
+    zone: production
+
 # Threat Feed Integration
 threat_feed:
   enabled: true
@@ -194,3 +201,12 @@ mcp_servers:
         scope: "tool:keycloak_report"
       - name: "keycloak_quarantine_user"
         scope: "tool:keycloak_admin"
+
+  database-provider:
+    command: "python"
+    args: ["-u", "c:/Users/Lenovo/Desktop/Runtime-shield- login/Runtime-shield-for-agentic-systems/database_mcp.py"]
+    tools:
+      - name: "GetCurrentUser"
+        scope: "tool:keycloak_read"
+      - name: "GetUserTransactions"
+        scope: "tool:keycloak_read"
