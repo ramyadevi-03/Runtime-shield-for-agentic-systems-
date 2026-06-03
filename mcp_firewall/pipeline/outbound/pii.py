@@ -1,8 +1,10 @@
-"""PII detector — detect personally identifiable information in tool responses."""
+"""PII detector — detect personally identifiable information in tool responses using Microsoft Presidio NLP."""
 
 from __future__ import annotations
 
-import re
+import logging
+import json
+from typing import Any
 
 from ..base import OutboundStage
 from ...models import (
@@ -14,20 +16,51 @@ from ...models import (
     ToolCallResponse,
 )
 
-# PII patterns: (name, regex) — used only when config.pii.outbound_patterns is empty
-PII_PATTERNS: list[tuple[str, str]] = [
-    ("Email Address", r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
-    ("Phone (International)", r"\+\d{1,3}[\s.-]?\(?\d{1,4}\)?[\s.-]?\d{2,4}[\s.-]?\d{2,4}[\s.-]?\d{0,4}"),
-    ("SSN (US)", r"\b\d{3}-\d{2}-\d{4}\b"),
-    ("Credit Card", r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b"),
-    ("IBAN", r"\b[A-Z]{2}\d{2}[A-Z0-9]{4,30}\b"),
-    ("AHV (Swiss SSN)", r"\b756\.\d{4}\.\d{4}\.\d{2}\b"),
-    ("IPv4 Address", r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"),
-]
+logger = logging.getLogger("pii_detector")
+
+_analyzer = None
+_anonymizer = None
+
+def get_presidio_instances():
+    global _analyzer, _anonymizer
+    if _analyzer is None or _anonymizer is None:
+        try:
+            from presidio_analyzer import AnalyzerEngine
+            from presidio_anonymizer import AnonymizerEngine
+            _analyzer = AnalyzerEngine()
+            _anonymizer = AnonymizerEngine()
+        except ImportError:
+            logger.warning("Presidio library not available in PIIDetector. Make sure it's installed.")
+    return _analyzer, _anonymizer
+
+
+def redact_json_structure(data: Any, redact_fn) -> Any:
+    if isinstance(data, dict):
+        return {k: redact_json_structure(v, redact_fn) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [redact_json_structure(item, redact_fn) for item in data]
+    elif isinstance(data, str):
+        if data.strip():
+            return redact_fn(data)
+        return data
+    else:
+        return data
+
+
+def redact_text_or_json(text: str, redact_raw_fn) -> str:
+    try:
+        stripped = text.strip()
+        if (stripped.startswith("{") and stripped.endswith("}")) or (stripped.startswith("[") and stripped.endswith("]")):
+            data = json.loads(stripped)
+            redacted_data = redact_json_structure(data, lambda t: redact_text_or_json(t, redact_raw_fn))
+            return json.dumps(redacted_data)
+    except Exception:
+        pass
+    return redact_raw_fn(text)
 
 
 class PIIDetector(OutboundStage):
-    """Detect and optionally redact PII in tool responses."""
+    """Detect and optionally redact PII in tool responses using Microsoft Presidio NLP (no regex)."""
 
     stage = PipelineStage.PII_DETECTOR
 
@@ -37,48 +70,63 @@ class PIIDetector(OutboundStage):
         if not config.pii.enabled:
             return response, None
 
+        analyzer, anonymizer = get_presidio_instances()
+        if not analyzer or not anonymizer:
+            logger.error("Presidio instances could not be loaded. Skipping PII redaction.")
+            return response, None
+
         findings: list[str] = []
         modified = False
-        patterns = getattr(config.pii, "outbound_patterns", []) or []
+
+        # Extract Presidio configuration
+        cfg_entities = getattr(config.pii, "presidio_entities", [])
+        entities = None
+        if cfg_entities and cfg_entities != ["ALL"]:
+            entities = cfg_entities
+
+        exclude_entities = getattr(config.pii, "presidio_exclude_entities", []) or []
+        raw_operators = getattr(config.pii, "presidio_operators", {}) or {}
+        default_placeholder = config.pii.placeholder
+
+        from presidio_anonymizer.entities import OperatorConfig
+
+        def redact_raw_text(text: str) -> str:
+            nonlocal modified
+            try:
+                results = analyzer.analyze(text=text, language="en", entities=entities)
+                if exclude_entities:
+                    results = [r for r in results if r.entity_type not in exclude_entities]
+
+                if results:
+                    for r in results:
+                        findings.append(r.entity_type)
+
+                    if config.pii.action == Action.REDACT:
+                        operators = {
+                            ent: OperatorConfig("replace", {"new_value": val})
+                            for ent, val in raw_operators.items()
+                        }
+                        default_op = OperatorConfig("replace", {"new_value": default_placeholder})
+                        for result in results:
+                            if result.entity_type not in operators:
+                                operators[result.entity_type] = default_op
+
+                        anonymized = anonymizer.anonymize(text=text, analyzer_results=results, operators=operators)
+                        if anonymized.text != text:
+                            modified = True
+                            return anonymized.text
+            except Exception as e:
+                logger.error(f"Error in Presidio scan: {e}")
+            return text
 
         for i, content_item in enumerate(response.content):
             text = content_item.get("text", "")
             if not text:
                 continue
 
-            default_placeholder = config.pii.placeholder
-            if not patterns:
-                for name, pattern in PII_PATTERNS:
-                    matches = list(re.finditer(pattern, text))
-                    if matches:
-                        findings.append(name)
-
-                        if config.pii.action == Action.REDACT:
-                            for match in reversed(matches):
-                                text = text[: match.start()] + default_placeholder + text[match.end() :]
-                                modified = True
-            else:
-                for pat_config in patterns:
-                    name = pat_config.get("name", "Unknown PII")
-                    pattern = pat_config.get("pattern", "")
-                    # Per-pattern placeholder → config.pii.placeholder fallback
-                    placeholder = pat_config.get("placeholder") or default_placeholder
-                    if not pattern:
-                        continue
-                    try:
-                        matches = list(re.finditer(pattern, text))
-                        if matches:
-                            findings.append(name)
-
-                            if config.pii.action == Action.REDACT:
-                                for match in reversed(matches):
-                                    text = text[: match.start()] + placeholder + text[match.end() :]
-                                    modified = True
-                    except Exception:
-                        pass
-
-            if modified:
-                response.content[i] = {**content_item, "text": text}
+            new_text = redact_text_or_json(text, redact_raw_text)
+            if new_text != text:
+                response.content[i] = {**content_item, "text": new_text}
 
         if not findings:
             return response, None
@@ -87,8 +135,8 @@ class PIIDetector(OutboundStage):
         decision = PipelineDecision(
             stage=self.stage,
             action=config.pii.action,
-            reason=f"PII detected: {', '.join(unique)}",
-            severity=config.pii.severity,  # configurable via pii.severity in YAML
+            reason=f"PII detected via Presidio NLP: {', '.join(unique)}",
+            severity=config.pii.severity,
             details={"pii_types": unique},
         )
         return response, decision

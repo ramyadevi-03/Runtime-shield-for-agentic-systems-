@@ -1099,10 +1099,7 @@ def redact_pii_with_presidio(text: str, is_raw: bool = False, skip_headers: bool
     exclude_entities = []
     raw_operators = {}
     default_placeholder = "[PII REDACTED]"
-    regex_fallbacks = [
-        {"name": "Credit Card", "pattern": r'\b\d{4}-\d{4}-\d{4}-\d{4}\b', "placeholder": '[REDACTED-CC]'},
-        {"name": "Phone", "pattern": r'\b\d{3}-\d{4}\b', "placeholder": '[REDACTED-PHONE]'}
-    ]
+    regex_fallbacks = [] # DISABLED: regex things disabled to test Microsoft NLP
 
     if gateway_instance and gateway_instance.config and gateway_instance.config.pii:
         pii_cfg = gateway_instance.config.pii
@@ -1114,8 +1111,6 @@ def redact_pii_with_presidio(text: str, is_raw: bool = False, skip_headers: bool
         if getattr(pii_cfg, "presidio_operators", {}):
             raw_operators = pii_cfg.presidio_operators
         default_placeholder = getattr(pii_cfg, "placeholder", default_placeholder)
-        if getattr(pii_cfg, "regex_fallbacks", []):
-            regex_fallbacks = pii_cfg.regex_fallbacks
 
     try:
         analyzer, anonymizer = get_presidio_instances()
@@ -4968,21 +4963,21 @@ setInterval(() => {
                             log(f"⚠️ Scan execution error: {scan_err} - falling back to safe local Presidio/regex redaction.")
                             line_str = redact_pii_with_presidio(line_str)
 
-                        # 3. Fast Local Manual Redaction Fallback (always run locally, no network/heavy NLP)
-                        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-                        manual_redacted = re.sub(email_pattern, '[REDACTED]', line_str)
-                        if manual_redacted != line_str:
-                            log("✂️ FIREWALL REDACTED sensitive data (Manual Fallback)")
-                            line_str = manual_redacted
-                            dashboard_state.add_event({
-                                "action": "redact",
-                                "tool": "(response)",
-                                "agent": "claude-desktop",
-                                "reason": "Email PII (Fallback)",
-                                "severity": "medium",
-                                "stage": "output-filter-fallback",
-                                "timestamp": time.time()
-                            })
+                        # 3. Fast Local Manual Redaction Fallback (DISABLED to test Microsoft NLP)
+                        # email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+                        # manual_redacted = re.sub(email_pattern, '[REDACTED]', line_str)
+                        # if manual_redacted != line_str:
+                        #     log("✂️ FIREWALL REDACTED sensitive data (Manual Fallback)")
+                        #     line_str = manual_redacted
+                        #     dashboard_state.add_event({
+                        #         "action": "redact",
+                        #         "tool": "(response)",
+                        #         "agent": "claude-desktop",
+                        #         "reason": "Email PII (Fallback)",
+                        #         "severity": "medium",
+                        #         "stage": "output-filter-fallback",
+                        #         "timestamp": time.time()
+                        #     })
 
                         if not line_str.endswith("\n"):
                             line_str += "\n"

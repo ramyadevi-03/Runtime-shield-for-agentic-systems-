@@ -65,16 +65,16 @@ dynamic_blocks: []
 
 # General Rules (evaluated in order: FIRST MATCH WINS)
 rules:
-  # 0. Redact PII (Emails) from any response
-  - name: redact-emails
-    tool: "*"
-    action: redact
-    message: "PII Redaction: Automated email masking active."
-    match:
-      arguments:
-        role: "user"
-      response:
-        regex: ".*@.*"
+#  # 0. Redact PII (Emails) from any response (DISABLED to test Microsoft NLP)
+#  - name: redact-emails
+#    tool: "*"
+#    action: redact
+#    message: "PII Redaction: Automated email masking active."
+#    match:
+#      arguments:
+#        role: "user"
+#      response:
+#        regex: ".*@.*"
   # 1. Block directory traversal patterns (using globs)
   - name: block-traversal
     tool: "read_file|list_directory|write_file"
