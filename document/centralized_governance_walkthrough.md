@@ -135,7 +135,7 @@ Response Details:
 ## 📈 Centralized Governance Highlights
 - **100% LLM-Agnostic**: Compatible with any ReAct agent framework, LangChain client, custom HTTP chatbot, or standard stdio MCP hosts (e.g., Claude Desktop, Cursor, Windsurf).
 - **Hardened Ingress Security**: Normalization occurs *before* role check (RBAC), SPIFFE SVID verification, firewall policy scanning, and JIT downscoped token exchange, guaranteeing that normalized aliases do not bypass our zero-trust boundaries.
-- **Robust Output Redaction**: Responses are securely processed by the Presidio/regex sanitization pipeline before returning to the caller.
+- **Robust Output Redaction**: Responses are securely processed by the JSON-aware Presidio NLP sanitization pipeline before returning to the caller.
 
 ---
 

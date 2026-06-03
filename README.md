@@ -13,7 +13,7 @@ It acts as a stateful, unified interception bridge between any AI client and its
     *   **SPIFFE/SPIRE (Workload Identity):** Strict cryptographic SVID client certificate verification (`X-SPIFFE-CERT`) attested against the local CA trust bundle (`ca.crt`).
 2.  **Policy Firewall (Layer 3):** Real-time tool-call inspection against `mcp-firewall.yaml` to block directory traversal and unauthorized path access.
 3.  **Fraud Engine (Layer 4):** Behavioral risk scoring that automatically quarantines agents displaying suspicious or repetitive attack patterns.
-4.  **Privacy Router (Layer 5):** In-flight PII redaction (Microsoft Presidio + Regex) that scrubs emails and secrets from tool outputs before the AI can see them.
+4.  **Privacy Router (Layer 5):** In-flight JSON-aware PII redaction (Microsoft Presidio NLP) that scrubs PII from tool outputs before the AI can see them.
 5.  **Infrastructure Isolation (Layer 1):** Secure execution in isolated "Experiment Zones" and Docker-bound containers.
 
 ---
@@ -72,9 +72,9 @@ Verify the active security layers using the following programmatic test suites:
 
 3. **PII Redaction Test:**
    ```powershell
-   python scratch/test_redaction.py
+   python scratch/test_json_aware.py
    ```
-   *Validates Presidio-based in-flight redaction of sensitive outputs (emails, credit cards) before they reach the LLM.*
+   *Validates JSON-aware Microsoft Presidio NLP in-flight PII redaction (emails, SSNs) before they reach the LLM.*
 
 ---
 
